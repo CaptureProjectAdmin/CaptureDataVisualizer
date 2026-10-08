@@ -114,12 +114,18 @@
       <aside id="annotate-panel" class="annotate-panel" hidden>
         <div class="panel">
           <h2>Annotate</h2>
-          <p class="annotate-note">Saved in EventTable.csv at the playhead time. Several events can share one time.</p>
-          <div id="annotate-marks" class="annotate-marks"></div>
           <div class="annotate-add-mark">
-            <input id="annotate-new-mark" type="text" maxlength="200" placeholder="Add a mark" aria-label="New annotation mark" />
+            <input id="annotate-new-mark" type="text" maxlength="200" placeholder="Add an event" aria-label="New event" />
             <button id="annotate-add-mark" type="button">Add</button>
           </div>
+          <div class="annotate-transfer">
+            <button id="annotate-export" type="button">Export</button>
+            <button id="annotate-import" type="button">Import</button>
+            <input id="annotate-import-file" type="file" accept=".txt,text/plain" hidden />
+          </div>
+          <h3>Default annotations</h3>
+          <div id="annotate-marks" class="annotate-marks"></div>
+          <p class="annotate-note">Saved in EventTable.csv at the playhead time. Several events can share one time.</p>
           <label class="annotate-field">
             <span>Event</span>
             <input id="annotate-event" type="text" maxlength="200" placeholder="Event" />

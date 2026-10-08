@@ -7,6 +7,7 @@ const EYE_OVERLAY_KEY = "capture-app-eye-overlay";
 const ANNOTATE_OPEN_KEY = "capture-app-annotate-open";
 const SENSORS_OPEN_KEY = "capture-app-sensors-open";
 const ANNOTATE_MARKS_KEY = "capture-app-annotation-marks";
+const EVENT_LIST_KEY = "capture-app-event-names";
 const DEFAULT_MARKS = [
   "Walk Begin",
   "Walk End",
@@ -126,6 +127,9 @@ const els = {
   annotateAssign: document.getElementById("annotate-assign"),
   annotateStamp: document.getElementById("annotate-stamp"),
   annotateCurrent: document.getElementById("annotate-current"),
+  annotateExport: document.getElementById("annotate-export"),
+  annotateImport: document.getElementById("annotate-import"),
+  annotateImportFile: document.getElementById("annotate-import-file"),
 };
 
 let annotationStamp = null;
@@ -1428,19 +1432,35 @@ function saveCustomMarks(marks) {
   localStorage.setItem(ANNOTATE_MARKS_KEY, JSON.stringify(marks));
 }
 
-function annotationMarks() {
+function currentEventNames() {
+  const saved = localStorage.getItem(EVENT_LIST_KEY);
+  if (saved != null) {
+    try {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) {
+        return parsed.map((mark) => String(mark).trim()).filter(Boolean);
+      }
+    } catch {
+      // Fall through to the built-in list.
+    }
+  }
   const custom = loadCustomMarks().filter(
     (mark) => !DEFAULT_MARKS.some((item) => item.toLowerCase() === mark.toLowerCase()),
   );
-  return { custom };
+  return [...DEFAULT_MARKS, ...custom];
+}
+
+function saveEventNames(names) {
+  localStorage.setItem(EVENT_LIST_KEY, JSON.stringify(names));
 }
 
 function renderAnnotationMarks() {
   if (!els.annotateMarks) return;
-  const { custom } = annotationMarks();
+  const defaults = new Set(DEFAULT_MARKS.map((mark) => mark.toLowerCase()));
   els.annotateMarks.replaceChildren();
-  for (const mark of DEFAULT_MARKS) els.annotateMarks.append(annotationMarkButton(mark, false));
-  for (const mark of custom) els.annotateMarks.append(annotationMarkButton(mark, true));
+  for (const mark of currentEventNames()) {
+    els.annotateMarks.append(annotationMarkButton(mark, !defaults.has(mark.toLowerCase())));
+  }
 }
 
 function annotationMarkButton(mark, removable) {
@@ -1463,8 +1483,8 @@ function annotationMarkButton(mark, removable) {
   remove.setAttribute("aria-label", `Remove mark ${mark}`);
   remove.addEventListener("click", (event) => {
     event.stopPropagation();
-    const next = loadCustomMarks().filter((item) => item.toLowerCase() !== mark.toLowerCase());
-    saveCustomMarks(next);
+    const next = currentEventNames().filter((item) => item.toLowerCase() !== mark.toLowerCase());
+    saveEventNames(next);
     renderAnnotationMarks();
   });
   const wrap = document.createElement("span");
@@ -1650,16 +1670,67 @@ async function removeEvent(row) {
   syncAnnotations(true);
 }
 
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportEventNames() {
+  const names = currentEventNames();
+  downloadTextFile("events.txt", names.length ? `${names.join("\n")}\n` : "");
+}
+
+function parseEventNameText(text) {
+  const names = [];
+  const seen = new Set();
+  const lines = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const name = lines[index].trim();
+    if (!name) continue;
+    if (name.length > 200) throw new Error(`Line ${index + 1} is too long.`);
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
+}
+
+async function importEventNames(file) {
+  const text = await file.text();
+  let names;
+  try {
+    names = parseEventNameText(text);
+  } catch (error) {
+    alert(error.message);
+    return;
+  }
+  if (!names.length) {
+    alert("That file has no events.");
+    return;
+  }
+  if (currentEventNames().length && !window.confirm("Replace the current events with this file?")) return;
+  saveEventNames(names);
+  renderAnnotationMarks();
+}
+
 function addAnnotationMark() {
   const mark = els.annotateNewMark?.value.trim() || "";
   if (!mark) return;
-  const known = [...DEFAULT_MARKS, ...loadCustomMarks()];
+  const known = currentEventNames();
   if (known.some((item) => item.toLowerCase() === mark.toLowerCase())) {
     if (els.annotateEvent) els.annotateEvent.value = mark;
     els.annotateNewMark.value = "";
     return;
   }
-  saveCustomMarks([...loadCustomMarks(), mark]);
+  saveEventNames([...known, mark]);
   els.annotateNewMark.value = "";
   renderAnnotationMarks();
   if (els.annotateEvent) els.annotateEvent.value = mark;
@@ -1735,6 +1806,14 @@ function wireEvents() {
     if (event.key !== "Enter") return;
     event.preventDefault();
     assignEvent().catch((err) => alert(`Could not save EventTable.csv: ${err.message}`));
+  });
+  els.annotateExport?.addEventListener("click", exportEventNames);
+  els.annotateImport?.addEventListener("click", () => els.annotateImportFile?.click());
+  els.annotateImportFile?.addEventListener("change", () => {
+    const file = els.annotateImportFile.files?.[0];
+    els.annotateImportFile.value = "";
+    if (!file) return;
+    importEventNames(file).catch((error) => alert(`Could not import events: ${error.message}`));
   });
   els.annotateAddMark?.addEventListener("click", addAnnotationMark);
   els.annotateNewMark?.addEventListener("keydown", (event) => {
