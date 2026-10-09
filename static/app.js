@@ -8,6 +8,10 @@ const ANNOTATE_OPEN_KEY = "capture-app-annotate-open";
 const SENSORS_OPEN_KEY = "capture-app-sensors-open";
 const ANNOTATE_MARKS_KEY = "capture-app-annotation-marks";
 const EVENT_LIST_KEY = "capture-app-event-names";
+const JUMP_KEY = "capture-app-jump-seconds";
+const EXPORT_OPEN_KEY = "capture-app-export-open";
+const EXPORT_COLLAPSED_KEY = "capture-app-export-collapsed";
+const EXPORT_CELL_CONFIRM = 2_000_000;
 const DEFAULT_MARKS = [
   "Walk Begin",
   "Walk End",
@@ -52,6 +56,14 @@ function paintThemedCharts() {
     }
     chart.redraw();
   }
+  if (state.syncChart) {
+    for (const axisObj of state.syncChart.axes) {
+      axisObj.stroke = axis;
+      if (axisObj.grid) axisObj.grid.stroke = grid;
+    }
+    state.syncChart.series[1].stroke = cssVar("--accent");
+    state.syncChart.redraw();
+  }
 }
 
 function toggleTheme() {
@@ -93,7 +105,14 @@ const state = {
   chartViews: new Map(),
   zoomAll: false,
   zoomWindow: 10,
+  syncChart: null,
+  syncReport: null,
   events: [],
+  exportSelected: new Set(),
+  exportMedia: new Set(),
+  exportCollapsed: new Set(),
+  exportSearchCollapsed: new Set(),
+  exportQuery: "",
 };
 
 const els = {
@@ -130,7 +149,52 @@ const els = {
   annotateExport: document.getElementById("annotate-export"),
   annotateImport: document.getElementById("annotate-import"),
   annotateImportFile: document.getElementById("annotate-import-file"),
+  annotatePrev: document.getElementById("annotate-prev"),
+  annotateNext: document.getElementById("annotate-next"),
+  annotatePrevLabel: document.getElementById("annotate-prev-label"),
+  annotateNextLabel: document.getElementById("annotate-next-label"),
+  annotateSearch: document.getElementById("annotate-search"),
+  annotateSearchResults: document.getElementById("annotate-search-results"),
+  jumpBack: document.getElementById("jump-back"),
+  jumpForward: document.getElementById("jump-forward"),
+  jumpWindow: document.getElementById("jump-window"),
+  exportToggle: document.getElementById("export-toggle"),
+  exportPanel: document.getElementById("export-panel"),
+  exportStreams: document.getElementById("export-streams"),
+  exportSearch: document.getElementById("export-search"),
+  exportAll: document.getElementById("export-all"),
+  exportNone: document.getElementById("export-none"),
+  exportStep: document.getElementById("export-step"),
+  exportStepField: document.getElementById("export-step-field"),
+  exportSamplingStep: document.getElementById("export-sampling-step"),
+  exportSamplingNative: document.getElementById("export-sampling-native"),
+  exportFull: document.getElementById("export-full"),
+  exportMedia: document.getElementById("export-media"),
+  exportModeTime: document.getElementById("export-mode-time"),
+  exportModeEvents: document.getElementById("export-mode-events"),
+  exportTimeFields: document.getElementById("export-time-fields"),
+  exportEventFields: document.getElementById("export-event-fields"),
+  exportStart: document.getElementById("export-start"),
+  exportEnd: document.getElementById("export-end"),
+  exportStartEvent: document.getElementById("export-start-event"),
+  exportEndEvent: document.getElementById("export-end-event"),
+  exportStartEventBtn: document.getElementById("export-start-event-btn"),
+  exportEndEventBtn: document.getElementById("export-end-event-btn"),
+  exportStartEventList: document.getElementById("export-start-event-list"),
+  exportEndEventList: document.getElementById("export-end-event-list"),
+  exportDownload: document.getElementById("export-download"),
+  exportStatus: document.getElementById("export-status"),
+  syncToggle: document.getElementById("sync-toggle"),
+  syncReport: document.getElementById("sync-report"),
+  syncBody: document.getElementById("sync-body"),
+  syncClose: document.getElementById("sync-close"),
+  syncPdf: document.getElementById("sync-pdf"),
+  syncMd: document.getElementById("sync-md"),
 };
+
+let exportMode = "time";
+let exportSampling = "step";
+let exportPickerOpen = null;
 
 let annotationStamp = null;
 let annotationFilled = null;
@@ -173,7 +237,9 @@ function setMeta(session) {
   const device = md["device name"] || "Unknown device";
   const when = md["recording time"] || "";
   const tz = md["recording timezone"] || "";
-  els.meta.textContent = `${device} · ${when} ${tz} · ${formatTime(session.duration)} · ${session.sensors.length} sensors`;
+  els.meta.textContent = `${device} · ${when} ${tz} · ${formatTime(session.duration)} · ${session.sensors.length} data streams`;
+  if (els.dataPath && session.data_dir) els.dataPath.value = session.data_dir;
+  if (els.syncToggle) els.syncToggle.disabled = !session.data_dir;
 }
 
 function ensureOpenMedia() {
@@ -1319,6 +1385,7 @@ function resizeCharts() {
     );
     fitChart(chart, stage);
   }
+  if (state.syncChart && state.syncChartHost) fitChart(state.syncChart, state.syncChartHost);
   state.map?.invalidateSize();
 }
 
@@ -1394,6 +1461,7 @@ function tick(now) {
 }
 
 async function loadSession(pathValue) {
+  closeSyncReport();
   const params = new URLSearchParams();
   if (pathValue) params.set("data_path", pathValue);
 
@@ -1412,6 +1480,7 @@ async function loadSession(pathValue) {
   setMeta(session);
   renderMediaToggles(session.media?.items || []);
   renderSensorList(session);
+  refreshExportPanel(session);
   configureMedia(session);
   await refreshCharts();
   await loadEvents();
@@ -1518,10 +1587,381 @@ function setSensorsOpen(open) {
   if (sidebar) sidebar.hidden = !open;
   if (resizer) resizer.hidden = !open;
   els.sensorsToggle?.setAttribute("aria-pressed", open ? "true" : "false");
-  const label = open ? "Hide sensors panel" : "Show sensors panel";
+  const label = open ? "Hide data streams" : "Show data streams";
   els.sensorsToggle?.setAttribute("aria-label", label);
   if (els.sensorsToggle) els.sensorsToggle.title = label;
   localStorage.setItem(SENSORS_OPEN_KEY, open ? "1" : "0");
+  requestAnimationFrame(resizeCharts);
+}
+
+function refreshExportPanel(session) {
+  if (els.exportStart) els.exportStart.value = "0";
+  const duration = Number(session?.duration) || 0;
+  if (els.exportEnd) els.exportEnd.value = String(Math.round(duration * 100) / 100);
+  const ids = new Set((session?.sensors || []).map((sensor) => sensor.id));
+  for (const id of [...state.exportSelected]) {
+    if (!ids.has(id)) state.exportSelected.delete(id);
+  }
+  renderExportStreams(session);
+  renderExportMedia(session);
+  renderExportEvents();
+  updateExportDownload();
+}
+
+function renderExportMedia(session) {
+  const root = els.exportMedia;
+  if (!root) return;
+  const items = session?.media?.items || [];
+  const ids = new Set(items.map((item) => item.id));
+  for (const id of [...state.exportMedia]) {
+    if (!ids.has(id)) state.exportMedia.delete(id);
+  }
+  root.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "sensor-empty";
+    empty.textContent = "No media files in this recording.";
+    root.append(empty);
+    return;
+  }
+  for (const item of items) {
+    const label = document.createElement("label");
+    label.className = "sensor-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.exportMedia.has(item.id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.exportMedia.add(item.id);
+      else state.exportMedia.delete(item.id);
+    });
+    const text = document.createElement("span");
+    text.textContent = item.label;
+    label.append(checkbox, text);
+    root.append(label);
+  }
+}
+
+function loadExportCollapsed() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(EXPORT_COLLAPSED_KEY) || "[]");
+    if (!Array.isArray(saved)) return;
+    state.exportCollapsed = new Set(saved.filter((item) => typeof item === "string"));
+  } catch {
+    state.exportCollapsed = new Set();
+  }
+}
+
+function saveExportCollapsed() {
+  localStorage.setItem(EXPORT_COLLAPSED_KEY, JSON.stringify([...state.exportCollapsed]));
+}
+
+function exportGroupDomId(group) {
+  return `export-group-${group.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+}
+
+function renderExportStreams(session) {
+  const root = els.exportStreams;
+  if (!root) return;
+  root.replaceChildren();
+  const query = (els.exportSearch?.value || "").trim().toLowerCase();
+  if (query !== state.exportQuery) {
+    state.exportQuery = query;
+    state.exportSearchCollapsed = new Set();
+  }
+  const groups = [];
+  let current = null;
+  for (const sensor of session?.sensors || []) {
+    const group = sensor.group || "Phone";
+    if (!current || current.name !== group) {
+      current = { name: group, sensors: [] };
+      groups.push(current);
+    }
+    if (!query || sensor.name.toLowerCase().includes(query)) current.sensors.push(sensor);
+  }
+  const visibleGroups = groups.filter((group) => group.sensors.length > 0);
+  if (!visibleGroups.length) {
+    const empty = document.createElement("p");
+    empty.className = "sensor-empty";
+    empty.textContent = query ? "No matching streams" : "Load a recording to choose streams.";
+    root.append(empty);
+    return;
+  }
+  for (const group of visibleGroups) {
+    const collapsed = (query ? state.exportSearchCollapsed : state.exportCollapsed).has(group.name);
+    const itemsId = exportGroupDomId(group.name);
+    const header = document.createElement("button");
+    header.type = "button";
+    header.className = "sensor-group-title";
+    header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    header.setAttribute("aria-controls", itemsId);
+    const chevron = document.createElement("span");
+    chevron.className = "sensor-group-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    const title = document.createElement("span");
+    title.textContent = group.name;
+    const count = document.createElement("small");
+    count.textContent = String(group.sensors.length);
+    header.append(chevron, title, count);
+    header.addEventListener("click", () => {
+      const target = query ? state.exportSearchCollapsed : state.exportCollapsed;
+      if (target.has(group.name)) target.delete(group.name);
+      else target.add(group.name);
+      if (!query) saveExportCollapsed();
+      renderExportStreams(session);
+    });
+    const items = document.createElement("div");
+    items.className = "sensor-group-items";
+    items.id = itemsId;
+    items.hidden = collapsed;
+    for (const sensor of group.sensors) {
+      const label = document.createElement("label");
+      label.className = `sensor-item${sensor.error ? " disabled" : ""}`;
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.disabled = Boolean(sensor.error);
+      checkbox.checked = state.exportSelected.has(sensor.id) && !sensor.error;
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) state.exportSelected.add(sensor.id);
+        else state.exportSelected.delete(sensor.id);
+        updateExportDownload();
+      });
+      const text = document.createElement("span");
+      appendHighlighted(text, sensor.name, query);
+      const meta = document.createElement("small");
+      meta.textContent = sensor.error ? "error" : `${(sensor.columns || []).length} col`;
+      label.append(checkbox, text, meta);
+      items.append(label);
+    }
+    root.append(header, items);
+  }
+}
+
+function renderExportEvents() {
+  const pickers = [
+    {
+      key: "start",
+      input: els.exportStartEvent,
+      button: els.exportStartEventBtn,
+      list: els.exportStartEventList,
+      fallback: 0,
+    },
+    {
+      key: "end",
+      input: els.exportEndEvent,
+      button: els.exportEndEventBtn,
+      list: els.exportEndEventList,
+      fallback: Math.max(state.events.length - 1, 0),
+    },
+  ];
+  const previous = pickers.map((picker) => {
+    if (!picker.input?.value || !picker.button?.textContent) return "";
+    return `${picker.input.value}\n${picker.button.textContent}`;
+  });
+  for (const [index, picker] of pickers.entries()) {
+    if (!picker.input || !picker.button || !picker.list) continue;
+    picker.list.replaceChildren();
+    if (!state.events.length) {
+      picker.input.value = "";
+      picker.button.textContent = "No events";
+      picker.button.disabled = true;
+      picker.list.hidden = true;
+      picker.button.setAttribute("aria-expanded", "false");
+      continue;
+    }
+    picker.button.disabled = false;
+    for (const row of state.events) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.setAttribute("role", "option");
+      const label = `${formatStamp(row.time)} ${row.event}`;
+      const value = String(stampSeconds(row.time));
+      choice.textContent = label;
+      choice.dataset.value = value;
+      choice.addEventListener("click", (event) => {
+        event.stopPropagation();
+        picker.input.value = value;
+        picker.button.textContent = label;
+        exportPickerOpen = null;
+        renderExportEvents();
+      });
+      picker.list.append(choice);
+    }
+    const match = [...picker.list.children].findIndex(
+      (choice) => `${choice.dataset.value}\n${choice.textContent}` === previous[index],
+    );
+    const chosen = picker.list.children[match >= 0 ? match : picker.fallback];
+    picker.input.value = chosen?.dataset.value || "";
+    picker.button.textContent = chosen?.textContent || "No events";
+    for (const choice of picker.list.children) {
+      choice.setAttribute("aria-selected", choice === chosen ? "true" : "false");
+    }
+    const open = exportPickerOpen === picker.key;
+    picker.list.hidden = !open;
+    picker.button.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  updateExportDownload();
+}
+
+function toggleExportPicker(key) {
+  exportPickerOpen = exportPickerOpen === key ? null : key;
+  renderExportEvents();
+  const list = key === "start" ? els.exportStartEventList : els.exportEndEventList;
+  if (exportPickerOpen === key) list?.scrollIntoView({ block: "nearest" });
+}
+
+function exportBounds() {
+  const step = Number(els.exportStep?.value);
+  if (exportMode === "events") {
+    return {
+      start: Number(els.exportStartEvent?.value),
+      end: Number(els.exportEndEvent?.value),
+      step,
+    };
+  }
+  return {
+    start: Number(els.exportStart?.value),
+    end: Number(els.exportEnd?.value),
+    step,
+  };
+}
+
+function updateExportDownload() {
+  const bounds = exportBounds();
+  const stepOk = exportSampling === "native" || (Number.isFinite(bounds.step) && bounds.step > 0);
+  const ok = state.exportSelected.size > 0
+    && Number.isFinite(bounds.start)
+    && Number.isFinite(bounds.end)
+    && stepOk;
+  if (els.exportDownload) els.exportDownload.disabled = !ok;
+}
+
+function setExportSampling(mode) {
+  exportSampling = mode === "native" ? "native" : "step";
+  els.exportSamplingStep?.setAttribute("aria-pressed", exportSampling === "step" ? "true" : "false");
+  els.exportSamplingNative?.setAttribute("aria-pressed", exportSampling === "native" ? "true" : "false");
+  if (els.exportStepField) els.exportStepField.hidden = exportSampling === "native";
+  updateExportDownload();
+}
+
+function setExportFull() {
+  setExportMode("time");
+  if (els.exportStart) els.exportStart.value = "0";
+  const duration = Number(state.session?.duration) || 0;
+  if (els.exportEnd) els.exportEnd.value = String(Math.round(duration * 100) / 100);
+  updateExportDownload();
+}
+
+function setExportMode(mode) {
+  exportMode = mode === "events" ? "events" : "time";
+  els.exportModeTime?.setAttribute("aria-pressed", exportMode === "time" ? "true" : "false");
+  els.exportModeEvents?.setAttribute("aria-pressed", exportMode === "events" ? "true" : "false");
+  if (els.exportTimeFields) els.exportTimeFields.hidden = exportMode !== "time";
+  if (els.exportEventFields) els.exportEventFields.hidden = exportMode !== "events";
+  updateExportDownload();
+}
+
+function samplesInRange(sensor, start, end) {
+  const count = Number(sensor?.row_count) || 0;
+  const first = Number(sensor?.time_min);
+  const last = Number(sensor?.time_max);
+  if (!count || !Number.isFinite(first) || !Number.isFinite(last) || last <= first) return count;
+  const overlap = Math.max(0, Math.min(end, last) - Math.max(start, first));
+  return Math.ceil(count * Math.min(1, overlap / (last - first)));
+}
+
+function exportCellEstimate(start, end, step) {
+  let columns = 1;
+  let rows = 0;
+  if (exportSampling === "native") {
+    for (const id of state.exportSelected) {
+      const sensor = state.session?.sensors?.find((item) => item.id === id);
+      columns += Math.max((sensor?.columns || []).length, 1);
+      rows += samplesInRange(sensor, start, end);
+    }
+    rows = Math.max(rows, 1);
+  } else {
+    const span = Math.max(end, start) - Math.min(end, start);
+    rows = Math.floor(span / step + 1e-9) + 1;
+    for (const id of state.exportSelected) {
+      const sensor = state.session?.sensors?.find((item) => item.id === id);
+      columns += Math.max((sensor?.columns || []).length, 1);
+    }
+  }
+  return { rows, columns, cells: rows * columns };
+}
+
+async function downloadExport() {
+  const bounds = exportBounds();
+  const native = exportSampling === "native";
+  if (!native && (!Number.isFinite(bounds.step) || bounds.step <= 0)) return;
+  let { start, end } = bounds;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+  if (end < start) [start, end] = [end, start];
+  const estimate = exportCellEstimate(start, end, bounds.step);
+  if (estimate.cells > EXPORT_CELL_CONFIRM) {
+    const proceed = window.confirm(
+      `This export is about ${estimate.rows.toLocaleString()} rows and ${estimate.columns.toLocaleString()} columns. Download it anyway?`,
+    );
+    if (!proceed) return;
+  }
+  const media = [...state.exportMedia];
+  if (els.exportStatus) {
+    els.exportStatus.textContent = media.length ? "Building CSV and trimming media…" : "Building CSV…";
+  }
+  if (els.exportDownload) els.exportDownload.disabled = true;
+  try {
+    const response = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        streams: [...state.exportSelected],
+        start,
+        end,
+        step: native ? undefined : bounds.step,
+        sampling: native ? "native" : "step",
+        media,
+      }),
+    });
+    if (!response.ok) {
+      let message = `Export failed (${response.status})`;
+      try {
+        const payload = await response.json();
+        if (typeof payload.detail === "string") message = payload.detail;
+      } catch {
+        /* keep the status message */
+      }
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const match = /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "");
+    const filename = match?.[1] || `streams_${start.toFixed(2)}_${end.toFixed(2)}.csv`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    const mediaNote = response.headers.get("X-Export-Media") === "none"
+      ? " No media files were found to trim."
+      : "";
+    if (els.exportStatus) els.exportStatus.textContent = `Downloaded ${filename}${mediaNote}`;
+  } catch (error) {
+    if (els.exportStatus) els.exportStatus.textContent = error.message;
+    alert(error.message);
+  } finally {
+    updateExportDownload();
+  }
+}
+
+function setExportOpen(open) {
+  document.getElementById("layout")?.classList.toggle("export-open", open);
+  if (els.exportPanel) els.exportPanel.hidden = !open;
+  els.exportToggle?.setAttribute("aria-pressed", open ? "true" : "false");
+  els.exportToggle?.setAttribute("aria-label", open ? "Hide export panel" : "Show export panel");
+  if (els.exportToggle) els.exportToggle.title = open ? "Hide export panel" : "Show export panel";
+  localStorage.setItem(EXPORT_OPEN_KEY, open ? "1" : "0");
   requestAnimationFrame(resizeCharts);
 }
 
@@ -1591,12 +2031,125 @@ function renderEventsAtStamp(stamp) {
   }
 }
 
+function annotationGroups() {
+  const groups = [];
+  const rows = state.events
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => stampSeconds(a.row.time) - stampSeconds(b.row.time) || a.index - b.index);
+  for (const { row } of rows) {
+    const time = stampSeconds(row.time);
+    const last = groups[groups.length - 1];
+    if (last && last.time === time) last.rows.push(row);
+    else groups.push({ time, rows: [row] });
+  }
+  return groups;
+}
+
+function neighborGroups() {
+  const now = stampSeconds(state.currentTime);
+  let previous = null;
+  let next = null;
+  for (const group of annotationGroups()) {
+    if (group.time < now) previous = group;
+    else if (group.time > now && !next) next = group;
+  }
+  return { previous, next };
+}
+
+function neighborText(group) {
+  if (!group) return "";
+  return `${formatStamp(group.time)} ${group.rows.map((row) => row.event).join(", ")}`;
+}
+
+function setNeighbor(button, input, group) {
+  if (button) button.disabled = !group;
+  if (!input) return;
+  const text = neighborText(group);
+  input.value = text;
+  input.title = text;
+}
+
+function renderAnnotationNeighbors() {
+  const { previous, next } = neighborGroups();
+  setNeighbor(els.annotatePrev, els.annotatePrevLabel, previous);
+  setNeighbor(els.annotateNext, els.annotateNextLabel, next);
+}
+
+function jumpToNeighbor(direction) {
+  const { previous, next } = neighborGroups();
+  const group = direction < 0 ? previous : next;
+  if (group) setCurrentTime(group.time);
+}
+
+function renderAnnotationSearch() {
+  const box = els.annotateSearchResults;
+  if (!box) return;
+  const query = els.annotateSearch?.value.trim().toLowerCase() || "";
+  box.replaceChildren();
+  if (!query) return;
+  const matches = [];
+  for (const group of annotationGroups()) {
+    for (const row of group.rows) {
+      const haystack = `${row.event} ${row.description || ""}`.toLowerCase();
+      if (haystack.includes(query)) matches.push(row);
+    }
+  }
+  if (!matches.length) {
+    const empty = document.createElement("div");
+    empty.className = "annotate-empty";
+    empty.textContent = "No matching events";
+    box.append(empty);
+    return;
+  }
+  for (const row of matches.slice(0, 40)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "annotate-search-hit";
+    const title = document.createElement("strong");
+    title.textContent = `${formatStamp(row.time)}  ${row.event}`;
+    button.append(title);
+    if (row.description) {
+      const detail = document.createElement("small");
+      detail.textContent = row.description;
+      button.append(detail);
+    }
+    button.addEventListener("click", () => setCurrentTime(row.time));
+    box.append(button);
+  }
+}
+
+function jumpSeconds() {
+  const value = Number(els.jumpWindow?.value);
+  return Number.isFinite(value) && value > 0 ? value : 10;
+}
+
+function updateJumpLabels() {
+  const seconds = jumpSeconds();
+  const label = Number.isInteger(seconds) ? String(seconds) : String(seconds);
+  if (els.jumpBack) {
+    const title = `Jump backward ${label} seconds`;
+    els.jumpBack.title = title;
+    els.jumpBack.setAttribute("aria-label", title);
+  }
+  if (els.jumpForward) {
+    const title = `Jump forward ${label} seconds`;
+    els.jumpForward.title = title;
+    els.jumpForward.setAttribute("aria-label", title);
+  }
+}
+
+function jumpBy(direction) {
+  setCurrentTime(state.currentTime + direction * jumpSeconds());
+}
+
 function syncAnnotations(force = false) {
   const stamp = stampSeconds(state.currentTime);
   if (els.annotateStamp) els.annotateStamp.textContent = formatStamp(stamp);
+  renderAnnotationNeighbors();
   if (!force && stamp === annotationStamp) return;
   annotationStamp = stamp;
   renderEventsAtStamp(stamp);
+  if (force) renderAnnotationSearch();
 }
 
 async function loadEvents() {
@@ -1608,6 +2161,7 @@ async function loadEvents() {
   }
   annotationStamp = null;
   syncAnnotations(true);
+  renderExportEvents();
 }
 
 async function saveEvents() {
@@ -1617,6 +2171,7 @@ async function saveEvents() {
     body: JSON.stringify({ events: state.events }),
   });
   state.events = Array.isArray(payload.events) ? payload.events : state.events;
+  renderExportEvents();
 }
 
 async function assignEvent() {
@@ -1736,6 +2291,430 @@ function addAnnotationMark() {
   if (els.annotateEvent) els.annotateEvent.value = mark;
 }
 
+let syncGeneration = 0;
+
+function syncNode(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function formatSyncClock(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatSyncMs(value, digits) {
+  if (!Number.isFinite(value)) return "—";
+  const text = Math.abs(value).toFixed(digits);
+  return value < 0 ? `−${text} ms` : `${text} ms`;
+}
+
+function formatSyncRange(low, high) {
+  const bound = (value) => {
+    const rounded = Math.round(value);
+    if (rounded < 0) return `−${Math.abs(rounded)}`;
+    if (rounded > 0) return `+${rounded}`;
+    return "0";
+  };
+  return `${bound(low)} to ${bound(high)} ms`;
+}
+
+function syncMedian(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function syncRelation(seconds, digits) {
+  const word = seconds < 0 ? "before" : "after";
+  return `${Math.abs(seconds).toFixed(digits)} s ${word}`;
+}
+
+function destroySyncChart() {
+  if (state.syncChart) {
+    state.syncChart.destroy();
+    state.syncChart = null;
+  }
+  state.syncChartHost = null;
+}
+
+function closeSyncReport() {
+  syncGeneration += 1;
+  destroySyncChart();
+  state.syncReport = null;
+  if (els.workspace) els.workspace.hidden = false;
+  if (els.syncReport) els.syncReport.hidden = true;
+  if (els.syncPdf) els.syncPdf.disabled = true;
+  if (els.syncMd) els.syncMd.disabled = true;
+  if (els.syncToggle) els.syncToggle.disabled = !state.session?.data_dir;
+  resizeCharts();
+}
+
+function openSyncShell(message) {
+  destroySyncChart();
+  state.syncReport = null;
+  if (els.workspace) els.workspace.hidden = true;
+  if (els.syncReport) els.syncReport.hidden = false;
+  if (els.syncPdf) els.syncPdf.disabled = true;
+  if (els.syncMd) els.syncMd.disabled = true;
+  els.syncBody?.replaceChildren(syncNode("p", null, message));
+}
+
+function buildSyncView(report) {
+  const clocks = report.clocks || {};
+  const emotibit = report.emotibit || {};
+  const audio = report.audio || {};
+  const recording = clocks.recording || "recording";
+  const hasAudio = Number.isFinite(audio.offset_median_ms) && (audio.windows_kept || 0) >= 3;
+  const kept = (audio.series || []).filter((row) => row.kept && Number.isFinite(row.lag_ms));
+  const half = Number.isFinite(audio.peak_half_width_p95_ms)
+    ? audio.peak_half_width_p95_ms
+    : Number.isFinite(audio.interval_high_ms) && Number.isFinite(audio.interval_low_ms)
+      ? (audio.interval_high_ms - audio.interval_low_ms) / 2
+      : null;
+  const emotiSpan = Number.isFinite(emotibit.window_start_phone_s) && Number.isFinite(emotibit.window_end_phone_s)
+    ? `${formatSyncClock(emotibit.window_start_phone_s)}–${formatSyncClock(emotibit.window_end_phone_s)}`
+    : "its sync window";
+  const extraMs = Number.isFinite(emotibit.rate_error_s_per_s) && Number.isFinite(emotibit.seconds_after_last_packet)
+    ? Math.abs(emotibit.rate_error_s_per_s) * emotibit.seconds_after_last_packet * 1000
+    : null;
+  const extraLow = extraMs == null ? null : emotibit.interval_low_ms - extraMs;
+  const extraHigh = extraMs == null ? null : emotibit.interval_high_ms + extraMs;
+  const span = audio.kept_span_s || [];
+  const spanMinutes = span.length === 2 ? Math.max(1, Math.round((span[1] - span[0]) / 60)) : null;
+  const driftMagnitude = Number.isFinite(audio.drift_across_kept_span_ms)
+    ? `${Math.abs(audio.drift_across_kept_span_ms).toFixed(2)} ms`
+    : "—";
+  const driftLabel = spanMinutes ? `Audio drift over ${spanMinutes} min` : "Audio drift";
+  const windowSeconds = Number.isFinite(emotibit.window_duration_s) ? Math.round(emotibit.window_duration_s) : null;
+  const halfText = half == null ? "the measured spread" : `±${half.toFixed(1)} ms`;
+  const lead = hasAudio
+    ? `A sound at phone time x is in the scene-camera file at x ${audio.offset_median_ms < 0 ? "−" : "+"} ${Math.abs(audio.offset_median_ms).toFixed(1)} ms, within about ${halfText}. The scene video uses that same offset. EmotiBit was measured on a separate ${windowSeconds == null ? "window" : `${windowSeconds}-second window`} and does not share this interval.`
+    : `The phone and scene audio did not produce a lag estimate. ${audio.claim || ""} EmotiBit was measured on a separate window and does not share an interval with the scene recording.`.replace(/\s+/g, " ");
+
+  const phoneHalf = Number.isFinite(clocks.phone_quantization_half_ms) ? Math.round(clocks.phone_quantization_half_ms) : 5;
+  const frameHalf = Number.isFinite(clocks.scene_frame_period_ms) ? Math.round(clocks.scene_frame_period_ms / 2) : 17;
+  const frameSpreadUs = Number.isFinite(clocks.scene_frame_dt_p95_ms) && Number.isFinite(clocks.scene_frame_dt_p05_ms)
+    ? (clocks.scene_frame_dt_p95_ms - clocks.scene_frame_dt_p05_ms) * 1000
+    : null;
+  const driftCell = hasAudio && spanMinutes
+    ? `${formatSyncMs(audio.drift_across_kept_span_ms, 2).replace(" ms", "")} ms over ${spanMinutes} min`
+    : "—";
+  const coverage = span.length === 2 ? `${(span[0] / 60).toFixed(1)}–${(span[1] / 60).toFixed(1)} min` : "—";
+  const rateClear = Number.isFinite(emotibit.rate_error_ppm)
+    && Number.isFinite(emotibit.rate_error_se_ppm)
+    && Math.abs(emotibit.rate_error_ppm) > 2 * Math.abs(emotibit.rate_error_se_ppm);
+  const rateText = Number.isFinite(emotibit.rate_error_ppm)
+    ? `${emotibit.rate_error_ppm < 0 ? "−" : ""}${Math.abs(emotibit.rate_error_ppm).toFixed(0)} ± ${Math.abs(emotibit.rate_error_se_ppm || 0).toFixed(0)} ppm`
+    : "—";
+
+  const rows = [
+    ["Phone sensors, time vs elapsed", "0", `±${phoneHalf} ms`, "None", "Whole recording"],
+    [
+      "Scene video vs its frame clock",
+      "Matched",
+      `±${frameHalf} ms (${Number(clocks.scene_time_stamps || 0).toLocaleString()} stamps, ${Number(clocks.scene_video_frames || 0).toLocaleString()} pictures)`,
+      frameSpreadUs != null && frameSpreadUs < 10 ? "None (about 1 µs spacing)" : "None",
+      "Whole scene video",
+    ],
+    hasAudio
+      ? ["Phone mic vs scene audio", formatSyncMs(audio.offset_median_ms, 1), half == null ? "—" : `±${half.toFixed(1)} ms`, driftCell, coverage]
+      : ["Phone mic vs scene audio", "No estimate", "—", "—", "—"],
+    [
+      "Gaze overlay vs scene frames",
+      Number.isFinite(clocks.info_json_minus_first_frame_s) ? `${clocks.info_json_minus_first_frame_s < 0 ? "−" : ""}${Math.abs(clocks.info_json_minus_first_frame_s).toFixed(2)} s` : "—",
+      "Player origin",
+      "Not a clock wander",
+      "Whole overlay",
+    ],
+    [
+      "EmotiBit vs host clock",
+      formatSyncMs(emotibit.residual_median_ms, 1),
+      Number.isFinite(emotibit.interval_low_ms) ? formatSyncRange(emotibit.interval_low_ms, emotibit.interval_high_ms) : "—",
+      rateText,
+      emotiSpan,
+    ],
+    [
+      "EmotiBit after the last packet",
+      "Same fit",
+      extraLow == null ? "—" : `about ${formatSyncRange(extraLow, extraHigh)}`,
+      "Extrapolated",
+      Number.isFinite(emotibit.window_end_phone_s) ? `${formatSyncClock(emotibit.window_end_phone_s)} to end of EmotiBit` : "After the last packet",
+    ],
+  ];
+
+  const pears = kept.map((row) => row.pearson).filter((value) => Number.isFinite(value));
+  const lags = kept.map((row) => row.lag_ms);
+  const widths = kept.map((row) => row.peak_half_width_ms).filter((value) => Number.isFinite(value));
+  const typicalWidth = syncMedian(widths);
+  const widest = widths.length ? Math.max(...widths) : null;
+  let audioBody = audio.claim || "No audio comparison was available.";
+  if (hasAudio && pears.length && lags.length && half != null && typicalWidth != null) {
+    audioBody = `Each point is the peak lag of a ${audio.window_s}-second window, stepped every ${audio.hop_s} seconds. Lag is scene-file time minus phone-file time for the same sound. ${audio.windows_kept} of ${audio.windows} windows correlated (${Math.min(...pears).toFixed(2)} to ${Math.max(...pears).toFixed(2)}). Their lags span ${formatSyncMs(Math.min(...lags), 2)} to ${formatSyncMs(Math.max(...lags), 2)}. A typical peak is ±${typicalWidth.toFixed(1)} ms wide; 95% are within ±${half.toFixed(1)} ms.`;
+    if (widest != null && widest > Math.max(10, (half || 0) * 4)) {
+      audioBody += ` One window was ±${widest.toFixed(0)} ms wide, and its lag still landed on the same offset.`;
+    }
+  }
+  const ahead = hasAudio ? -audio.offset_median_ms : null;
+  const frameMs = Number.isFinite(clocks.scene_first_frame_offset_s) ? clocks.scene_first_frame_offset_s * 1000 : null;
+  const playerNote = hasAudio && frameMs != null
+    ? `The horizontal axis is minutes from the phone recording epoch. The first scene frame is ${Math.abs(frameMs).toFixed(1)} ms ${frameMs < 0 ? "before" : "after"} that epoch, which matches this audio offset to ${Math.abs(frameMs + audio.offset_median_ms).toFixed(2)} ms. The player treats file time and phone time as the same number, so at a given slider position the scene picture is ${Math.abs(ahead).toFixed(0)} ms ${ahead >= 0 ? "ahead of" : "behind"} the phone sensors.`
+    : "";
+  const clockNote = `Phone time and seconds_elapsed differ by at most ${Number(clocks.phone_time_vs_elapsed_max_abs_ms || 0).toFixed(4)} ms, so the phone has no separate drift. The interval inside a phone stream at this sample period is half a sample, ±${phoneHalf} ms. Scene frames are ${Number(clocks.scene_frame_period_ms || 0).toFixed(3)} ms apart${frameSpreadUs == null ? "" : `, with about ${Math.max(1, Math.round(frameSpreadUs))} µs of variation`}. The frame file has ${Number(clocks.scene_time_stamps || 0).toLocaleString()} timestamps and the video has ${Number(clocks.scene_video_frames || 0).toLocaleString()} pictures.`;
+  const gazeBody = `info.json start_time is ${syncRelation(clocks.info_json_offset_s, 3)} the phone epoch and ${syncRelation(clocks.info_json_minus_first_frame_s, 2)} the first scene frame. The overlay follows that start time, so a gaze point is drawn on a different clock from the frame it belongs to. This is how the player defines time.`;
+  const dropped = Array.isArray(emotibit.dropped_rtt_ms) ? emotibit.dropped_rtt_ms : [];
+  const droppedMedian = syncMedian(dropped);
+  const droppedSentence = dropped.length
+    ? `${dropped.length} round trips of about ${(droppedMedian / 1000).toFixed(1)} s were dropped. `
+    : "";
+  const emotibitNote = `Twenty-five exchanges run from ${emotibit.window_start_denver || "—"} to ${emotibit.window_end_denver || "—"} Denver (phone elapsed ${Number(emotibit.window_start_phone_s || 0).toFixed(0)}–${Number(emotibit.window_end_phone_s || 0).toFixed(0)} s). ${droppedSentence}The other ${emotibit.packets_kept ?? "—"} have a median round trip of ${Number(emotibit.rtt_kept_median_ms || 0).toFixed(0)} ms. A host time of x matches the device clock within ${Number.isFinite(emotibit.interval_low_ms) ? formatSyncRange(emotibit.interval_low_ms, emotibit.interval_high_ms) : "—"} in that window. The fitted rate is ${rateText}${rateClear ? "." : ", close enough to the sync map that a rate error is not separately visible in that window."}`;
+  const extraBody = extraLow == null
+    ? "The packets do not support an extrapolation."
+    : `The packets stop with about ${Math.round(emotibit.seconds_after_last_packet).toLocaleString()} s of EmotiBit data still ahead. Carrying the fitted rate across that gap widens the interval to about ${formatSyncRange(extraLow, extraHigh)}. That wider range was not measured.`;
+
+  return {
+    recording,
+    title: `Synchronization on ${recording}`,
+    lead,
+    pairIntro: `An event at time x in the first stream is expected in the second at x + offset. The interval is around that, and only for the span in the last column. Phone epoch is ${clocks.phone_epoch_denver || "—"} Denver.`,
+    stats: [
+      { value: hasAudio ? formatSyncMs(audio.offset_median_ms, 1) : "No estimate", label: "Scene file minus phone file" },
+      { value: hasAudio && half != null ? `±${half.toFixed(1)} ms` : "—", label: "Where one scene sound lands" },
+      { value: hasAudio ? driftMagnitude : "—", label: driftLabel },
+      {
+        value: Number.isFinite(emotibit.interval_low_ms) ? formatSyncRange(emotibit.interval_low_ms, emotibit.interval_high_ms) : "—",
+        label: `EmotiBit, ${emotiSpan}`,
+      },
+    ],
+    rows,
+    tones: ["ok", "info", hasAudio ? "ok" : "warn", "warn", "info", "warn"],
+    audioTitle: "Phone microphone and scene audio",
+    audioBody,
+    playerNote,
+    showChart: hasAudio,
+    medianLag: hasAudio ? audio.offset_median_ms : null,
+    clockNote,
+    gazeTitle: "Gaze overlay uses a different origin",
+    gazeBody,
+    emotibitNote: emotibit.packets ? emotibitNote.replace("Twenty-five", `${emotibit.packets}`) : emotibitNote,
+    extraTitle: "After the measured window this is an extrapolation",
+    extraBody,
+    lagRows: audio.series || [],
+  };
+}
+
+function syncMarkdown(view) {
+  const cell = (value) => String(value).replaceAll("|", "\\|");
+  const lines = [
+    `# ${view.title}`,
+    "",
+    view.lead,
+    "",
+    "## Figures",
+    "",
+    ...view.stats.map((stat) => `- **${stat.value}** — ${stat.label}`),
+    "",
+    "## Offset and interval by pair",
+    "",
+    view.pairIntro,
+    "",
+    "| Pair | Offset | Interval | Drift | Coverage |",
+    "| --- | --- | --- | --- | --- |",
+    ...view.rows.map((row) => `| ${row.map(cell).join(" | ")} |`),
+    "",
+    `## ${view.audioTitle}`,
+    "",
+    view.audioBody,
+  ];
+  if (view.playerNote) lines.push("", view.playerNote);
+  if (view.lagRows.length) {
+    lines.push("", "| Phone time (s) | Lag (ms) | Pearson | Kept |", "| ---: | ---: | ---: | --- |");
+    for (const row of view.lagRows) {
+      lines.push(`| ${row.phone_s} | ${Number(row.lag_ms).toFixed(3)} | ${row.pearson} | ${row.kept ? "yes" : "no"} |`);
+    }
+  }
+  lines.push(
+    "",
+    "## Clocks already in the files",
+    "",
+    view.clockNote,
+    "",
+    `**${view.gazeTitle}.** ${view.gazeBody}`,
+    "",
+    "## EmotiBit sync packets",
+    "",
+    view.emotibitNote,
+    "",
+    `**${view.extraTitle}.** ${view.extraBody}`,
+    "",
+  );
+  return lines.join("\n");
+}
+
+function renderSyncReport(report) {
+  destroySyncChart();
+  const view = buildSyncView(report);
+  const safeName = String(view.recording).replace(/[^\w.-]+/g, "_");
+  state.syncReport = { markdown: syncMarkdown(view), filename: `sync_${safeName}.md` };
+  const body = els.syncBody;
+  body.replaceChildren();
+  body.append(syncNode("h2", null, view.title), syncNode("p", null, view.lead));
+  const stats = syncNode("div", "sync-stats");
+  for (const stat of view.stats) {
+    const card = syncNode("div", "sync-stat");
+    card.append(syncNode("strong", null, stat.value), syncNode("span", null, stat.label));
+    stats.append(card);
+  }
+  body.append(stats, syncNode("h3", null, "Offset and interval by pair"), syncNode("p", null, view.pairIntro));
+  const table = document.createElement("table");
+  table.className = "sync-table";
+  const head = document.createElement("tr");
+  for (const label of ["Pair", "Offset", "Interval", "Drift", "Coverage"]) head.append(syncNode("th", null, label));
+  const thead = document.createElement("thead");
+  thead.append(head);
+  const tbody = document.createElement("tbody");
+  view.rows.forEach((row, index) => {
+    const tr = document.createElement("tr");
+    if (view.tones[index]) tr.className = `sync-${view.tones[index]}`;
+    for (const value of row) tr.append(syncNode("td", null, value));
+    tbody.append(tr);
+  });
+  table.append(thead, tbody);
+  body.append(table, syncNode("h3", null, view.audioTitle), syncNode("p", null, view.audioBody));
+  if (view.showChart) {
+    const host = syncNode("div", "sync-chart");
+    body.append(host);
+    state.syncChartHost = host;
+    mountSyncChart(host, view.lagRows, view.medianLag);
+    if (view.playerNote) body.append(syncNode("p", "sync-note", view.playerNote));
+  }
+  body.append(syncNode("h3", null, "Clocks already in the files"), syncNode("p", null, view.clockNote));
+  const gaze = syncNode("div", "sync-callout");
+  gaze.append(syncNode("strong", null, view.gazeTitle), syncNode("p", null, view.gazeBody));
+  body.append(gaze, syncNode("h3", null, "EmotiBit sync packets"), syncNode("p", null, view.emotibitNote));
+  const extra = syncNode("div", "sync-callout");
+  extra.append(syncNode("strong", null, view.extraTitle), syncNode("p", null, view.extraBody));
+  body.append(extra);
+  if (els.syncPdf) els.syncPdf.disabled = false;
+  if (els.syncMd) els.syncMd.disabled = false;
+}
+
+function mountSyncChart(host, series, median) {
+  destroySyncChart();
+  state.syncChartHost = host;
+  const kept = series.filter((row) => row.kept && Number.isFinite(row.lag_ms) && Number.isFinite(row.phone_s));
+  if (kept.length < 3 || typeof uPlot === "undefined") return;
+  const times = kept.map((row) => row.phone_s);
+  const lags = kept.map((row) => row.lag_ms);
+  const span = Math.max(...lags) - Math.min(...lags);
+  const digits = span < 0.2 ? 3 : span < 2 ? 2 : 1;
+  state.syncChart = new uPlot(
+    {
+      width: Math.max(320, host.clientWidth || 640),
+      height: 240,
+      legend: { show: false },
+      cursor: { drag: { x: false, y: false, setScale: false } },
+      series: [{}, { label: "Scene minus phone", stroke: cssVar("--accent"), width: 1.5 }],
+      axes: [
+        { ...chartAxisStyle(), values: (_chart, vals) => vals.map((value) => `${Math.round(value / 60)}`) },
+        { ...chartAxisStyle(), size: 78, values: (_chart, vals) => vals.map((value) => value.toFixed(digits)) },
+      ],
+      scales: {
+        x: { time: false },
+        y: {
+          range: (_chart, min, max) => {
+            const pad = Math.max((max - min) * 0.35, 0.02);
+            return [min - pad, max + pad];
+          },
+        },
+      },
+      hooks: {
+        draw: [
+          (chart) => {
+            if (!Number.isFinite(median)) return;
+            const y = chart.valToPos(median, "y", true);
+            if (!Number.isFinite(y)) return;
+            const ctx = chart.ctx;
+            ctx.save();
+            ctx.strokeStyle = cssVar("--muted");
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(chart.bbox.left, y);
+            ctx.lineTo(chart.bbox.left + chart.bbox.width, y);
+            ctx.stroke();
+            ctx.restore();
+          },
+        ],
+      },
+    },
+    [times, lags],
+    host,
+  );
+}
+
+function renderSyncError(message) {
+  state.syncReport = null;
+  destroySyncChart();
+  const text = /<html/i.test(message || "")
+    ? "The sync measurement is not available. Restart the visualizer and try again."
+    : (message || "Synchronization measurement failed.");
+  els.syncBody?.replaceChildren(syncNode("h2", null, "Synchronization"), syncNode("p", null, text));
+  if (els.syncPdf) els.syncPdf.disabled = true;
+  if (els.syncMd) els.syncMd.disabled = true;
+}
+
+async function fetchSyncReport() {
+  const response = await fetch("/api/sync", { method: "POST" });
+  const text = await response.text();
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const detail = body && typeof body.detail === "string" ? body.detail : text;
+    throw new Error(detail || response.statusText);
+  }
+  return body;
+}
+
+async function runSyncReport() {
+  if (!state.session?.data_dir) return;
+  const request = ++syncGeneration;
+  if (els.syncToggle) els.syncToggle.disabled = true;
+  openSyncShell("Measuring synchronization…");
+  try {
+    const report = await fetchSyncReport();
+    if (request !== syncGeneration) return;
+    renderSyncReport(report);
+  } catch (error) {
+    if (request !== syncGeneration) return;
+    renderSyncError(error.message);
+  } finally {
+    if (request === syncGeneration && els.syncToggle) els.syncToggle.disabled = !state.session?.data_dir;
+  }
+}
+
+function saveSyncMarkdown() {
+  if (!state.syncReport) return;
+  const blob = new Blob([state.syncReport.markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = state.syncReport.filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function wireEvents() {
   els.reloadBtn.addEventListener("click", () => {
     loadSession(els.dataPath.value.trim()).catch((err) => {
@@ -1799,6 +2778,59 @@ function wireEvents() {
   els.annotateToggle?.addEventListener("click", () => {
     setAnnotateOpen(els.annotateToggle.getAttribute("aria-pressed") !== "true");
   });
+  els.exportToggle?.addEventListener("click", () => {
+    setExportOpen(els.exportToggle.getAttribute("aria-pressed") !== "true");
+  });
+  els.syncToggle?.addEventListener("click", () => {
+    runSyncReport();
+  });
+  els.syncClose?.addEventListener("click", closeSyncReport);
+  els.syncPdf?.addEventListener("click", () => window.print());
+  els.syncMd?.addEventListener("click", saveSyncMarkdown);
+  els.exportAll?.addEventListener("click", () => {
+    for (const sensor of state.session?.sensors || []) {
+      if (!sensor.error) state.exportSelected.add(sensor.id);
+    }
+    renderExportStreams(state.session);
+    updateExportDownload();
+  });
+  els.exportNone?.addEventListener("click", () => {
+    state.exportSelected.clear();
+    renderExportStreams(state.session);
+    updateExportDownload();
+  });
+  els.exportSamplingStep?.addEventListener("click", () => setExportSampling("step"));
+  els.exportSamplingNative?.addEventListener("click", () => setExportSampling("native"));
+  els.exportFull?.addEventListener("click", setExportFull);
+  els.exportModeTime?.addEventListener("click", () => setExportMode("time"));
+  els.exportModeEvents?.addEventListener("click", () => setExportMode("events"));
+  els.exportStartEventBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (els.exportStartEventBtn.disabled) return;
+    toggleExportPicker("start");
+  });
+  els.exportEndEventBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (els.exportEndEventBtn.disabled) return;
+    toggleExportPicker("end");
+  });
+  document.addEventListener("click", (event) => {
+    if (!exportPickerOpen) return;
+    const target = event.target;
+    if (target instanceof Node && (els.exportEventFields?.contains(target))) return;
+    exportPickerOpen = null;
+    renderExportEvents();
+  });
+  els.exportSearch?.addEventListener("input", () => {
+    if (state.session) renderExportStreams(state.session);
+  });
+  for (const input of [els.exportStep, els.exportStart, els.exportEnd, els.exportStartEvent, els.exportEndEvent]) {
+    input?.addEventListener("input", updateExportDownload);
+    input?.addEventListener("change", updateExportDownload);
+  }
+  els.exportDownload?.addEventListener("click", () => {
+    downloadExport().catch((error) => alert(error.message));
+  });
   els.annotateAssign?.addEventListener("click", () => {
     assignEvent().catch((error) => alert(`Could not save EventTable.csv: ${error.message}`));
   });
@@ -1815,6 +2847,17 @@ function wireEvents() {
     if (!file) return;
     importEventNames(file).catch((error) => alert(`Could not import events: ${error.message}`));
   });
+  els.jumpBack?.addEventListener("click", () => jumpBy(-1));
+  els.jumpForward?.addEventListener("click", () => jumpBy(1));
+  els.jumpWindow?.addEventListener("change", () => {
+    const next = Number(els.jumpWindow.value);
+    if (!Number.isFinite(next) || next <= 0) els.jumpWindow.value = "10";
+    localStorage.setItem(JUMP_KEY, els.jumpWindow.value);
+    updateJumpLabels();
+  });
+  els.annotatePrev?.addEventListener("click", () => jumpToNeighbor(-1));
+  els.annotateNext?.addEventListener("click", () => jumpToNeighbor(1));
+  els.annotateSearch?.addEventListener("input", renderAnnotationSearch);
   els.annotateAddMark?.addEventListener("click", addAnnotationMark);
   els.annotateNewMark?.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
@@ -1829,8 +2872,14 @@ async function init() {
   ensureOpenMedia();
   loadRotations();
   renderAnnotationMarks();
+  const savedJump = Number(localStorage.getItem(JUMP_KEY));
+  if (els.jumpWindow && Number.isFinite(savedJump) && savedJump > 0) els.jumpWindow.value = String(savedJump);
+  updateJumpLabels();
+  renderAnnotationNeighbors();
   setSensorsOpen(localStorage.getItem(SENSORS_OPEN_KEY) !== "0");
   setAnnotateOpen(localStorage.getItem(ANNOTATE_OPEN_KEY) === "1");
+  setExportOpen(localStorage.getItem(EXPORT_OPEN_KEY) === "1");
+  loadExportCollapsed();
   PanelLayout.init({
     workspace: els.workspace,
     layout: document.getElementById("layout"),
@@ -1847,6 +2896,7 @@ async function init() {
     setMeta(session);
     renderMediaToggles(session.media?.items || []);
     renderSensorList(session);
+    refreshExportPanel(session);
     configureMedia(session);
     await refreshCharts();
     await loadEvents();

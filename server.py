@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import csv
+import io
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -10,12 +15,14 @@ import numpy as np
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from loaders import load_sensors, ordered_sensors, reload_sensor
 from loaders.common import sensor_view
 from loaders.eyetracking import load_eye_overlay
+from sync_accuracy import evaluate
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = BASE_DIR / "Data"
@@ -403,6 +410,414 @@ def api_save_events(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     events = _clean_events(rows)
     _write_events(events)
     return {"events": events}
+
+
+_EXPORT_MAX_ROWS = 500_000
+_EXPORT_MAX_CELLS = 8_000_000
+
+
+def _step_decimals(step: float) -> int:
+    text = f"{step:.8f}".rstrip("0")
+    if "." not in text:
+        return 0
+    return min(8, len(text.split(".", 1)[1]))
+
+
+def _to_float_array(values: list[Any]) -> np.ndarray:
+    out = np.empty(len(values), dtype=float)
+    for index, value in enumerate(values):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            out[index] = np.nan
+            continue
+        out[index] = number if np.isfinite(number) else np.nan
+    return out
+
+
+def _sample_tolerance(times: np.ndarray, step: float) -> float:
+    if times.size < 2:
+        return step
+    gaps = np.diff(times)
+    gaps = gaps[np.isfinite(gaps) & (gaps > 0)]
+    median = float(np.median(gaps)) if gaps.size else step
+    return max(1.5 * median, step)
+
+
+def _asof_column(grid: np.ndarray, times: np.ndarray, values: np.ndarray, step: float) -> np.ndarray:
+    out = np.full(grid.shape, np.nan)
+    finite = np.isfinite(times) & np.isfinite(values)
+    times = times[finite]
+    values = values[finite]
+    if times.size == 0:
+        return out
+    order = np.argsort(times, kind="mergesort")
+    times = times[order]
+    values = values[order]
+    index = np.searchsorted(times, grid, side="right") - 1
+    valid = index >= 0
+    if not np.any(valid):
+        return out
+    chosen = index[valid]
+    gaps = grid[valid] - times[chosen]
+    keep = gaps <= _sample_tolerance(times, step) + 1e-9
+    targets = np.flatnonzero(valid)[keep]
+    out[targets] = values[chosen][keep]
+    return out
+
+
+def _export_header(group: str, name: str, column: str, used: set[str]) -> str:
+    label = f"{group} / {name} / {column}".replace("\n", " ").replace("\r", " ")
+    unique = label
+    suffix = 2
+    while unique in used:
+        unique = f"{label} ({suffix})"
+        suffix += 1
+    used.add(unique)
+    return unique
+
+
+def _load_export_sensor(sensor: dict[str, Any]) -> dict[str, Any]:
+    limit = int(sensor.get("row_count") or 0)
+    if limit < 1:
+        limit = 5_000_000
+    return reload_sensor(
+        sensor,
+        Path(_session["data_dir"]),
+        _session.get("origin_s"),
+        limit,
+    )
+
+
+def _export_columns(stream_ids: list[str], grid: np.ndarray, step: float) -> list[tuple[str, np.ndarray]]:
+    sensors = _session["sensors"]
+    columns: list[tuple[str, np.ndarray]] = []
+    used: set[str] = {"time_s"}
+    for stream_id in stream_ids:
+        sensor = sensors.get(stream_id)
+        if sensor is None:
+            raise HTTPException(status_code=404, detail=f"Unknown data stream: {stream_id}")
+        if "error" in sensor:
+            raise HTTPException(status_code=400, detail=f"{sensor.get('name') or stream_id} cannot be exported.")
+        try:
+            full = _load_export_sensor(sensor)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        times = np.asarray(full.get("times") or [], dtype=float)
+        series = full.get("series") or {}
+        names = list(full.get("series_columns") or series.keys())
+        if not names:
+            raise HTTPException(status_code=400, detail=f"{sensor.get('name') or stream_id} has no columns.")
+        group = str(full.get("group") or sensor.get("group") or "")
+        name = str(full.get("name") or sensor.get("name") or stream_id)
+        for column in names:
+            raw = series.get(column) or []
+            if len(raw) != len(times):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{name} column {column} does not match its time axis.",
+                )
+            filled = _asof_column(grid, times, _to_float_array(raw), step)
+            columns.append((_export_header(group, name, column, used), filled))
+    return columns
+
+
+def _iter_export_csv(grid: np.ndarray, columns: list[tuple[str, np.ndarray]], decimals: int):
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["time_s", *[header for header, _ in columns]])
+    arrays = [values for _, values in columns]
+
+    def flush() -> str:
+        text = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return text
+
+    yield flush()
+    for index, time in enumerate(grid):
+        row = [f"{float(time):.{decimals}f}"]
+        for values in arrays:
+            number = float(values[index])
+            row.append("" if not np.isfinite(number) else f"{number:.10g}")
+        writer.writerow(row)
+        if index % 250 == 249:
+            yield flush()
+    leftover = buffer.getvalue()
+    if leftover:
+        yield leftover
+
+
+def _write_export_csv(path: Path, grid: np.ndarray, columns: list[tuple[str, np.ndarray]], decimals: int) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        for chunk in _iter_export_csv(grid, columns, decimals):
+            handle.write(chunk)
+
+
+def _parse_export_range(payload: dict[str, Any]) -> tuple[float, float]:
+    try:
+        start = float(payload.get("start"))
+        end = float(payload.get("end"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Start and end must be numbers.") from exc
+    if not np.isfinite(start) or not np.isfinite(end):
+        raise HTTPException(status_code=400, detail="Start and end must be finite numbers.")
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _require_export_sensor(stream_id: str) -> dict[str, Any]:
+    sensor = _session["sensors"].get(stream_id)
+    if sensor is None:
+        raise HTTPException(status_code=404, detail=f"Unknown data stream: {stream_id}")
+    if "error" in sensor:
+        raise HTTPException(status_code=400, detail=f"{sensor.get('name') or stream_id} cannot be exported.")
+    return sensor
+
+
+def _window_mask(times: np.ndarray, start: float, end: float) -> np.ndarray:
+    return np.isfinite(times) & (times >= start - 1e-9) & (times <= end + 1e-9)
+
+
+def _place_native(grid: np.ndarray, times: np.ndarray, values: np.ndarray) -> np.ndarray:
+    out = np.full(grid.shape, np.nan)
+    if times.size == 0 or grid.size == 0:
+        return out
+    index = np.searchsorted(grid, times)
+    keep = index < grid.size
+    index = index[keep]
+    times = times[keep]
+    values = values[keep]
+    keep = grid[index] == times
+    out[index[keep]] = values[keep]
+    return out
+
+
+def _native_columns(stream_ids: list[str], start: float, end: float) -> tuple[np.ndarray, list[tuple[str, np.ndarray]]]:
+    pieces: list[tuple[str, str, np.ndarray, list[tuple[str, np.ndarray]]]] = []
+    used: set[str] = {"time_s"}
+    sample_count = 0
+    column_count = 0
+    for stream_id in stream_ids:
+        sensor = _require_export_sensor(stream_id)
+        try:
+            full = _load_export_sensor(sensor)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        times = np.asarray(full.get("times") or [], dtype=float)
+        series = full.get("series") or {}
+        names = list(full.get("series_columns") or series.keys())
+        if not names:
+            raise HTTPException(status_code=400, detail=f"{sensor.get('name') or stream_id} has no columns.")
+        mask = _window_mask(times, start, end)
+        kept: list[tuple[str, np.ndarray]] = []
+        for column in names:
+            raw = _to_float_array(series.get(column) or [])
+            if len(raw) != len(times):
+                label = sensor.get("name") or stream_id
+                raise HTTPException(status_code=400, detail=f"{label} column {column} does not match its time axis.")
+            kept.append((column, raw[mask]))
+        window_times = times[mask]
+        sample_count += int(window_times.size)
+        column_count += len(kept)
+        if sample_count > _EXPORT_MAX_ROWS:
+            raise HTTPException(
+                status_code=400,
+                detail="That range includes too many samples. Choose a shorter interval or fewer streams.",
+            )
+        if sample_count * max(column_count, 1) > _EXPORT_MAX_CELLS:
+            raise HTTPException(
+                status_code=400,
+                detail="That export is too large. Choose a shorter interval or fewer streams.",
+            )
+        group = str(full.get("group") or sensor.get("group") or "")
+        name = str(full.get("name") or sensor.get("name") or stream_id)
+        pieces.append((group, name, window_times, kept))
+
+    if sample_count == 0:
+        columns = [
+            (_export_header(group, name, column, used), np.zeros(0))
+            for group, name, _, kept in pieces
+            for column, _ in kept
+        ]
+        return np.zeros(0), columns
+
+    grid = np.unique(np.concatenate([times for _, _, times, _ in pieces if times.size]))
+    aligned = [
+        (_export_header(group, name, column, used), _place_native(grid, times, values))
+        for group, name, times, kept in pieces
+        for column, values in kept
+    ]
+    return grid, aligned
+
+
+def _step_columns(stream_ids: list[str], start: float, end: float, step: float) -> tuple[np.ndarray, list[tuple[str, np.ndarray]], int]:
+    if not np.isfinite(step) or step <= 0:
+        raise HTTPException(status_code=400, detail="Step must be greater than zero.")
+    row_count = int(np.floor((end - start) / step + 1e-9)) + 1
+    if row_count < 1:
+        row_count = 1
+    if row_count > _EXPORT_MAX_ROWS:
+        raise HTTPException(status_code=400, detail="That range and step would create too many rows. Use a larger step.")
+    grid = start + np.arange(row_count, dtype=float) * step
+    grid = grid[grid <= end + step * 1e-6]
+    column_count = 0
+    for stream_id in stream_ids:
+        sensor = _session["sensors"].get(stream_id)
+        if sensor is None or "error" in sensor:
+            continue
+        column_count += len(sensor.get("series_columns") or []) or 1
+    if len(grid) * max(column_count, 1) > _EXPORT_MAX_CELLS:
+        raise HTTPException(status_code=400, detail="That export is too large. Choose fewer streams or a larger step.")
+    return grid, _export_columns(stream_ids, grid, step), _step_decimals(step)
+
+
+def _media_export_items() -> list[dict[str, Any]]:
+    media = _session.get("media") or {}
+    items = media.get("items") or []
+    return [item for item in items if isinstance(item, dict) and item.get("path")]
+
+
+def _selected_media_items(media_ids: Any) -> list[dict[str, Any]]:
+    if not isinstance(media_ids, list):
+        return []
+    wanted = {item for item in media_ids if isinstance(item, str) and item}
+    if not wanted:
+        return []
+    return [item for item in _media_export_items() if item.get("id") in wanted]
+
+
+def _trim_media_files(dest_dir: Path, start: float, end: float, items: list[dict[str, Any]]) -> list[Path]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=400, detail="ffmpeg was not found, so media files cannot be trimmed.")
+    data_dir = Path(_session["data_dir"])
+    duration = max(end - start, 0.001)
+    written: list[Path] = []
+    used: set[str] = set()
+    for item in items:
+        src = (data_dir / str(item["path"])).resolve()
+        try:
+            src.relative_to(data_dir.resolve())
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail="Invalid media path") from exc
+        if not src.is_file():
+            continue
+        filename = src.name
+        if filename in used:
+            filename = f"{item.get('id') or 'media'}_{filename}"
+        used.add(filename)
+        dst = dest_dir / filename
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(src),
+            "-t",
+            f"{duration:.3f}",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(dst),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(status_code=400, detail=f"Trimming {item.get('label') or filename} took too long.") from exc
+        if result.returncode != 0 or not dst.is_file():
+            detail = (result.stderr or result.stdout or "ffmpeg failed").strip().splitlines()
+            message = detail[-1] if detail else "ffmpeg failed"
+            label = item.get("label") or filename
+            raise HTTPException(status_code=400, detail=f"Could not trim {label}: {message}")
+        written.append(dst)
+    return written
+
+
+def _export_zip(
+    csv_name: str,
+    grid: np.ndarray,
+    columns: list[tuple[str, np.ndarray]],
+    decimals: int,
+    start: float,
+    end: float,
+    items: list[dict[str, Any]],
+) -> FileResponse:
+    tmp = tempfile.TemporaryDirectory(prefix="capture-export-")
+    try:
+        root = Path(tmp.name)
+        csv_path = root / csv_name
+        _write_export_csv(csv_path, grid, columns, decimals)
+        media_dir = root / "trimmed"
+        media_dir.mkdir()
+        trimmed = _trim_media_files(media_dir, start, end, items)
+        zip_name = f"streams_{start:.2f}_{end:.2f}.zip"
+        zip_path = root / zip_name
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.write(csv_path, csv_name, compress_type=zipfile.ZIP_DEFLATED)
+            for path in trimmed:
+                archive.write(path, f"media/{path.name}", compress_type=zipfile.ZIP_STORED)
+    except Exception:
+        tmp.cleanup()
+        raise
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=zip_path.name,
+        background=BackgroundTask(tmp.cleanup),
+    )
+
+
+@app.post("/api/export", response_model=None)
+def api_export(payload: dict[str, Any] = Body(...)) -> StreamingResponse | FileResponse:
+    if not _session.get("data_dir"):
+        raise HTTPException(status_code=404, detail="No recording loaded.")
+    stream_ids = payload.get("streams")
+    if not isinstance(stream_ids, list) or not stream_ids or not all(isinstance(item, str) and item for item in stream_ids):
+        raise HTTPException(status_code=400, detail="Choose at least one data stream.")
+    sampling = payload.get("sampling") or "step"
+    if sampling not in {"step", "native"}:
+        raise HTTPException(status_code=400, detail="Choose step or original rate sampling.")
+    start, end = _parse_export_range(payload)
+    if sampling == "native":
+        grid, columns = _native_columns(stream_ids, start, end)
+        decimals = 6
+    else:
+        try:
+            step = float(payload.get("step"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Step must be a number.") from exc
+        grid, columns, decimals = _step_columns(stream_ids, start, end, step)
+    filename = f"streams_{start:.2f}_{end:.2f}.csv"
+    requested_media = payload.get("media")
+    media_items = _selected_media_items(requested_media)
+    if media_items:
+        return _export_zip(filename, grid, columns, decimals, start, end, media_items)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if isinstance(requested_media, list) and any(isinstance(item, str) and item for item in requested_media):
+        headers["X-Export-Media"] = "none"
+    return StreamingResponse(
+        _iter_export_csv(grid, columns, decimals),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
+
+@app.post("/api/sync")
+def api_sync() -> dict[str, Any]:
+    data_dir = _session.get("data_dir")
+    if not data_dir:
+        raise HTTPException(status_code=404, detail="No recording loaded.")
+    try:
+        return evaluate(Path(data_dir))
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "Synchronization measurement failed.") from exc
 
 
 @app.get("/api/eye/overlay")

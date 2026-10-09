@@ -58,8 +58,10 @@
           <input id="data-path" type="text" placeholder="Data" />
         </label>
         <button id="reload-btn" type="button">Load</button>
-        <button id="sensors-toggle" type="button" class="ghost-btn" aria-pressed="true" aria-label="Hide sensors panel" title="Hide sensors panel">Sensors</button>
+        <button id="sensors-toggle" type="button" class="ghost-btn" aria-pressed="true" aria-label="Hide data streams" title="Hide data streams">Data Streams</button>
         <button id="annotate-toggle" type="button" class="ghost-btn" aria-pressed="false" aria-label="Show annotation panel" title="Show annotation panel">Annotate</button>
+        <button id="export-toggle" type="button" class="ghost-btn" aria-pressed="false" aria-label="Show export panel" title="Show export panel">Export</button>
+        <button id="sync-toggle" type="button" class="ghost-btn" disabled aria-label="Measure synchronization" title="Measure synchronization">Sync</button>
         <button id="theme-toggle" type="button" class="theme-toggle" role="switch" aria-checked="true" aria-label="Light theme" title="Switch to dark theme">
           <svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="4"></circle>
@@ -77,7 +79,7 @@
       <aside class="sidebar" id="sidebar">
         <div class="panel">
           <div class="panel-header">
-            <h2>Sensors</h2>
+            <h2>Data Streams</h2>
             <div class="panel-actions">
               <button id="select-all" type="button" class="link-btn">All</button>
               <button id="select-none" type="button" class="link-btn">None</button>
@@ -110,6 +112,14 @@
             <div id="audio-placeholder" class="placeholder">No audio file found — loudness chart available from Microphone.csv</div>
           </section>
         </div>
+        <section id="sync-report" class="sync-report" hidden>
+          <div class="sync-toolbar">
+            <button id="sync-close" type="button" class="ghost-btn">Close</button>
+            <button id="sync-pdf" type="button" class="ghost-btn" disabled>Save PDF</button>
+            <button id="sync-md" type="button" class="ghost-btn" disabled>Save Markdown</button>
+          </div>
+          <div id="sync-body" class="sync-body"></div>
+        </section>
       </main>
       <aside id="annotate-panel" class="annotate-panel" hidden>
         <div class="panel">
@@ -125,6 +135,11 @@
           </div>
           <h3>Default annotations</h3>
           <div id="annotate-marks" class="annotate-marks"></div>
+          <label class="annotate-field">
+            <span>Search events</span>
+            <input id="annotate-search" type="search" placeholder="Search events" aria-label="Search events" />
+          </label>
+          <div id="annotate-search-results" class="annotate-search-results"></div>
           <p class="annotate-note">Saved in EventTable.csv at the playhead time. Several events can share one time.</p>
           <label class="annotate-field">
             <span>Event</span>
@@ -138,8 +153,84 @@
             <button id="annotate-assign" type="button">Assign</button>
             <span id="annotate-stamp" class="annotate-stamp">0:00.00</span>
           </div>
-          <h3>At this time</h3>
+          <h3>Event Information</h3>
+          <div class="annotate-nav">
+            <div class="annotate-nav-side">
+              <button id="annotate-prev" type="button">Previous</button>
+              <input id="annotate-prev-label" type="text" readonly placeholder="No previous event" aria-label="Previous event" />
+            </div>
+            <div class="annotate-nav-side">
+              <button id="annotate-next" type="button">Next</button>
+              <input id="annotate-next-label" type="text" readonly placeholder="No next event" aria-label="Next event" />
+            </div>
+          </div>
+          <h3>Current:</h3>
           <div id="annotate-current" class="annotate-current"></div>
+        </div>
+      </aside>
+      <aside id="export-panel" class="export-panel" hidden>
+        <div class="panel">
+          <h2>Export</h2>
+          <p class="annotate-note">One CSV for the selected streams. A cell stays blank when that stream has no sample on the row.</p>
+          <div class="panel-header">
+            <h3>Data streams</h3>
+            <div class="panel-actions">
+              <button id="export-all" type="button" class="link-btn">All</button>
+              <button id="export-none" type="button" class="link-btn">None</button>
+            </div>
+          </div>
+          <input id="export-search" class="sensor-search" type="search" placeholder="Search streams" aria-label="Search streams" />
+          <div id="export-streams" class="sensor-list export-streams"></div>
+          <div class="export-sampling">
+            <h3>Sampling</h3>
+            <div class="export-mode" role="group" aria-label="Sampling">
+              <button id="export-sampling-step" type="button" aria-pressed="true">Step</button>
+              <button id="export-sampling-native" type="button" aria-pressed="false">Original rate</button>
+            </div>
+            <label id="export-step-field" class="annotate-field">
+              <span>Step (seconds)</span>
+              <input id="export-step" type="number" min="0.001" step="0.01" value="0.1" />
+            </label>
+          </div>
+          <div class="panel-header export-interval-header">
+            <h3>Export Interval</h3>
+            <div class="panel-actions">
+              <button id="export-full" type="button" class="link-btn">Full Data</button>
+            </div>
+          </div>
+          <div class="export-mode" role="group" aria-label="Export interval">
+            <button id="export-mode-time" type="button" aria-pressed="true">Time</button>
+            <button id="export-mode-events" type="button" aria-pressed="false">Events</button>
+          </div>
+          <div id="export-time-fields" class="export-range">
+            <label class="annotate-field">
+              <span>Start (seconds)</span>
+              <input id="export-start" type="number" min="0" step="0.01" value="0" />
+            </label>
+            <label class="annotate-field">
+              <span>End (seconds)</span>
+              <input id="export-end" type="number" min="0" step="0.01" value="0" />
+            </label>
+          </div>
+          <div id="export-event-fields" class="export-range" hidden>
+            <div class="annotate-field export-picker">
+              <span>Start event</span>
+              <input id="export-start-event" type="hidden" />
+              <button id="export-start-event-btn" type="button" class="export-picker-btn" aria-expanded="false" aria-controls="export-start-event-list">No events</button>
+              <div id="export-start-event-list" class="export-picker-list" role="listbox" aria-label="Start event" hidden></div>
+            </div>
+            <div class="annotate-field export-picker">
+              <span>End event</span>
+              <input id="export-end-event" type="hidden" />
+              <button id="export-end-event-btn" type="button" class="export-picker-btn" aria-expanded="false" aria-controls="export-end-event-list">No events</button>
+              <div id="export-end-event-list" class="export-picker-list" role="listbox" aria-label="End event" hidden></div>
+            </div>
+          </div>
+          <h3>Media</h3>
+          <p class="annotate-note">Checked files are cut to this interval. Nothing is trimmed when none are checked.</p>
+          <div id="export-media" class="export-media"></div>
+          <button id="export-download" type="button" disabled>Download</button>
+          <p id="export-status" class="annotate-note"></p>
         </div>
       </aside>
     </div>
@@ -151,6 +242,14 @@
         <span id="current-time">0:00</span>
         <span class="sep">/</span>
         <span id="total-time">0:00</span>
+      </div>
+      <div class="transport-jump">
+        <button id="jump-back" type="button" aria-label="Jump backward 10 seconds" title="Jump backward 10 seconds">◀</button>
+        <label class="chart-window">
+          <input id="jump-window" type="number" min="0.1" step="0.5" value="10" aria-label="Jump size in seconds" />
+          <span>s</span>
+        </label>
+        <button id="jump-forward" type="button" aria-label="Jump forward 10 seconds" title="Jump forward 10 seconds">▶</button>
       </div>
       <label class="speed-control">
         Speed
