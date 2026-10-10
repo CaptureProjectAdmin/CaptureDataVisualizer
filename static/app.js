@@ -2902,7 +2902,7 @@ async function init() {
     await loadEvents();
     setCurrentTime(0);
   } catch {
-    els.meta.textContent = "Place Sensor Logger CSV export in Data/, then click Load.";
+    els.meta.textContent = "Write the path to a CaptureApp CSV exported data folder then click Load.";
   }
 }
 
