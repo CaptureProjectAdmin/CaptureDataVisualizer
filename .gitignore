@@ -22,3 +22,6 @@ sync_batch_results/
 summary.csv
 lags.csv
 recordings/
+
+# Batch fixation exports
+fixation_exports/
