@@ -467,7 +467,7 @@ def _asof_column(grid: np.ndarray, times: np.ndarray, values: np.ndarray, step: 
 
 
 def _export_header(group: str, name: str, column: str, used: set[str]) -> str:
-    label = f"{group} / {name} / {column}".replace("\n", " ").replace("\r", " ")
+    label = f"{group}_{name}_{column}".replace("\n", " ").replace("\r", " ")
     unique = label
     suffix = 2
     while unique in used:
@@ -740,6 +740,39 @@ def _trim_media_files(dest_dir: Path, start: float, end: float, items: list[dict
     return written
 
 
+def _export_file_stem(group: str, name: str) -> str:
+    label = f"{group}_{name}".replace("\n", " ").replace("\r", " ").strip()
+    cleaned = "".join("_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in label)
+    return cleaned.strip(" .") or "stream"
+
+
+def _unique_csv_name(group: str, name: str, used: set[str]) -> str:
+    stem = _export_file_stem(group, name)
+    filename = f"{stem}.csv"
+    suffix = 2
+    while filename.lower() in used:
+        filename = f"{stem}_{suffix}.csv"
+        suffix += 1
+    used.add(filename.lower())
+    return filename
+
+
+def _zip_response(root: Path, csv_paths: list[Path], media_paths: list[Path], start: float, end: float, tmp: tempfile.TemporaryDirectory[str]) -> FileResponse:
+    zip_name = f"streams_{start:.2f}_{end:.2f}.zip"
+    zip_path = root / zip_name
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for path in csv_paths:
+            archive.write(path, path.name, compress_type=zipfile.ZIP_DEFLATED)
+        for path in media_paths:
+            archive.write(path, f"media/{path.name}", compress_type=zipfile.ZIP_STORED)
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=zip_path.name,
+        background=BackgroundTask(tmp.cleanup),
+    )
+
+
 def _export_zip(
     csv_name: str,
     grid: np.ndarray,
@@ -757,21 +790,47 @@ def _export_zip(
         media_dir = root / "trimmed"
         media_dir.mkdir()
         trimmed = _trim_media_files(media_dir, start, end, items)
-        zip_name = f"streams_{start:.2f}_{end:.2f}.zip"
-        zip_path = root / zip_name
-        with zipfile.ZipFile(zip_path, "w") as archive:
-            archive.write(csv_path, csv_name, compress_type=zipfile.ZIP_DEFLATED)
-            for path in trimmed:
-                archive.write(path, f"media/{path.name}", compress_type=zipfile.ZIP_STORED)
+        return _zip_response(root, [csv_path], trimmed, start, end, tmp)
     except Exception:
         tmp.cleanup()
         raise
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=zip_path.name,
-        background=BackgroundTask(tmp.cleanup),
-    )
+
+
+def _export_separate(
+    stream_ids: list[str],
+    sampling: str,
+    start: float,
+    end: float,
+    step: float | None,
+    items: list[dict[str, Any]],
+) -> FileResponse:
+    """One CSV per stream. Original rate uses that stream's own sample times."""
+    tmp = tempfile.TemporaryDirectory(prefix="capture-export-")
+    try:
+        root = Path(tmp.name)
+        csv_paths: list[Path] = []
+        used: set[str] = set()
+        for stream_id in stream_ids:
+            sensor = _require_export_sensor(stream_id)
+            if sampling == "native":
+                grid, columns = _native_columns([stream_id], start, end)
+                decimals = 6
+            else:
+                grid, columns, decimals = _step_columns([stream_id], start, end, float(step))
+            group = str(sensor.get("group") or "")
+            name = str(sensor.get("name") or stream_id)
+            csv_path = root / _unique_csv_name(group, name, used)
+            _write_export_csv(csv_path, grid, columns, decimals)
+            csv_paths.append(csv_path)
+        trimmed: list[Path] = []
+        if items:
+            media_dir = root / "trimmed"
+            media_dir.mkdir()
+            trimmed = _trim_media_files(media_dir, start, end, items)
+        return _zip_response(root, csv_paths, trimmed, start, end, tmp)
+    except Exception:
+        tmp.cleanup()
+        raise
 
 
 @app.post("/api/export", response_model=None)
@@ -781,22 +840,29 @@ def api_export(payload: dict[str, Any] = Body(...)) -> StreamingResponse | FileR
     stream_ids = payload.get("streams")
     if not isinstance(stream_ids, list) or not stream_ids or not all(isinstance(item, str) and item for item in stream_ids):
         raise HTTPException(status_code=400, detail="Choose at least one data stream.")
-    sampling = payload.get("sampling") or "step"
+    sampling = payload.get("sampling") or "native"
     if sampling not in {"step", "native"}:
         raise HTTPException(status_code=400, detail="Choose step or original rate sampling.")
+    layout = payload.get("layout") or "combined"
+    if layout not in {"combined", "separate"}:
+        raise HTTPException(status_code=400, detail="Choose one table or separate files.")
     start, end = _parse_export_range(payload)
-    if sampling == "native":
-        grid, columns = _native_columns(stream_ids, start, end)
-        decimals = 6
-    else:
+    requested_media = payload.get("media")
+    media_items = _selected_media_items(requested_media)
+    step: float | None = None
+    if sampling != "native":
         try:
             step = float(payload.get("step"))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Step must be a number.") from exc
-        grid, columns, decimals = _step_columns(stream_ids, start, end, step)
+    if layout == "separate" and len(stream_ids) > 1:
+        return _export_separate(stream_ids, sampling, start, end, step, media_items)
+    if sampling == "native":
+        grid, columns = _native_columns(stream_ids, start, end)
+        decimals = 6
+    else:
+        grid, columns, decimals = _step_columns(stream_ids, start, end, float(step))
     filename = f"streams_{start:.2f}_{end:.2f}.csv"
-    requested_media = payload.get("media")
-    media_items = _selected_media_items(requested_media)
     if media_items:
         return _export_zip(filename, grid, columns, decimals, start, end, media_items)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}

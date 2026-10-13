@@ -168,6 +168,9 @@ const els = {
   exportStepField: document.getElementById("export-step-field"),
   exportSamplingStep: document.getElementById("export-sampling-step"),
   exportSamplingNative: document.getElementById("export-sampling-native"),
+  exportLayoutCombined: document.getElementById("export-layout-combined"),
+  exportLayoutSeparate: document.getElementById("export-layout-separate"),
+  exportNote: document.getElementById("export-note"),
   exportFull: document.getElementById("export-full"),
   exportMedia: document.getElementById("export-media"),
   exportModeTime: document.getElementById("export-mode-time"),
@@ -193,7 +196,8 @@ const els = {
 };
 
 let exportMode = "time";
-let exportSampling = "step";
+let exportSampling = "native";
+let exportLayout = "combined";
 let exportPickerOpen = null;
 
 let annotationStamp = null;
@@ -1843,6 +1847,17 @@ function setExportSampling(mode) {
   updateExportDownload();
 }
 
+function setExportLayout(mode) {
+  exportLayout = mode === "separate" ? "separate" : "combined";
+  els.exportLayoutCombined?.setAttribute("aria-pressed", exportLayout === "combined" ? "true" : "false");
+  els.exportLayoutSeparate?.setAttribute("aria-pressed", exportLayout === "separate" ? "true" : "false");
+  if (els.exportNote) {
+    els.exportNote.textContent = exportLayout === "separate"
+      ? "One CSV for each selected stream, downloaded together."
+      : "One CSV for the selected streams. A cell stays blank when that stream has no sample on the row.";
+  }
+}
+
 function setExportFull() {
   setExportMode("time");
   if (els.exportStart) els.exportStart.value = "0";
@@ -1870,6 +1885,24 @@ function samplesInRange(sensor, start, end) {
 }
 
 function exportCellEstimate(start, end, step) {
+  const span = Math.max(end, start) - Math.min(end, start);
+  const stepRows = Math.floor(span / step + 1e-9) + 1;
+  if (exportLayout === "separate") {
+    let cells = 0;
+    let rows = 0;
+    let columns = 1;
+    for (const id of state.exportSelected) {
+      const sensor = state.session?.sensors?.find((item) => item.id === id);
+      const streamColumns = Math.max((sensor?.columns || []).length, 1);
+      const streamRows = exportSampling === "native"
+        ? Math.max(samplesInRange(sensor, start, end), 1)
+        : stepRows;
+      rows += streamRows;
+      columns = Math.max(columns, streamColumns + 1);
+      cells += streamRows * (streamColumns + 1);
+    }
+    return { rows, columns, cells };
+  }
   let columns = 1;
   let rows = 0;
   if (exportSampling === "native") {
@@ -1880,8 +1913,7 @@ function exportCellEstimate(start, end, step) {
     }
     rows = Math.max(rows, 1);
   } else {
-    const span = Math.max(end, start) - Math.min(end, start);
-    rows = Math.floor(span / step + 1e-9) + 1;
+    rows = stepRows;
     for (const id of state.exportSelected) {
       const sensor = state.session?.sensors?.find((item) => item.id === id);
       columns += Math.max((sensor?.columns || []).length, 1);
@@ -1905,8 +1937,12 @@ async function downloadExport() {
     if (!proceed) return;
   }
   const media = [...state.exportMedia];
+  const separate = exportLayout === "separate" && state.exportSelected.size > 1;
   if (els.exportStatus) {
-    els.exportStatus.textContent = media.length ? "Building CSV and trimming media…" : "Building CSV…";
+    if (separate && media.length) els.exportStatus.textContent = "Building one CSV per stream and trimming media…";
+    else if (separate) els.exportStatus.textContent = "Building one CSV per stream…";
+    else if (media.length) els.exportStatus.textContent = "Building CSV and trimming media…";
+    else els.exportStatus.textContent = "Building CSV…";
   }
   if (els.exportDownload) els.exportDownload.disabled = true;
   try {
@@ -1919,6 +1955,7 @@ async function downloadExport() {
         end,
         step: native ? undefined : bounds.step,
         sampling: native ? "native" : "step",
+        layout: exportLayout === "separate" ? "separate" : "combined",
         media,
       }),
     });
@@ -2801,6 +2838,8 @@ function wireEvents() {
   });
   els.exportSamplingStep?.addEventListener("click", () => setExportSampling("step"));
   els.exportSamplingNative?.addEventListener("click", () => setExportSampling("native"));
+  els.exportLayoutCombined?.addEventListener("click", () => setExportLayout("combined"));
+  els.exportLayoutSeparate?.addEventListener("click", () => setExportLayout("separate"));
   els.exportFull?.addEventListener("click", setExportFull);
   els.exportModeTime?.addEventListener("click", () => setExportMode("time"));
   els.exportModeEvents?.addEventListener("click", () => setExportMode("events"));

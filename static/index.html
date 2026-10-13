@@ -171,7 +171,7 @@
       <aside id="export-panel" class="export-panel" hidden>
         <div class="panel">
           <h2>Export</h2>
-          <p class="annotate-note">One CSV for the selected streams. A cell stays blank when that stream has no sample on the row.</p>
+          <p id="export-note" class="annotate-note">One CSV for the selected streams. A cell stays blank when that stream has no sample on the row.</p>
           <div class="panel-header">
             <h3>Data streams</h3>
             <div class="panel-actions">
@@ -184,13 +184,20 @@
           <div class="export-sampling">
             <h3>Sampling</h3>
             <div class="export-mode" role="group" aria-label="Sampling">
-              <button id="export-sampling-step" type="button" aria-pressed="true">Step</button>
-              <button id="export-sampling-native" type="button" aria-pressed="false">Original rate</button>
+              <button id="export-sampling-step" type="button" aria-pressed="false">Step</button>
+              <button id="export-sampling-native" type="button" aria-pressed="true">Original rate</button>
             </div>
-            <label id="export-step-field" class="annotate-field">
+            <label id="export-step-field" class="annotate-field" hidden>
               <span>Step (seconds)</span>
               <input id="export-step" type="number" min="0.001" step="0.01" value="0.1" />
             </label>
+          </div>
+          <div class="export-sampling">
+            <h3>Files</h3>
+            <div class="export-mode" role="group" aria-label="Export files">
+              <button id="export-layout-combined" type="button" aria-pressed="true">One table</button>
+              <button id="export-layout-separate" type="button" aria-pressed="false">Separate files</button>
+            </div>
           </div>
           <div class="panel-header export-interval-header">
             <h3>Export Interval</h3>

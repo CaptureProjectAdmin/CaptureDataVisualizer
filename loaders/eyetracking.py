@@ -1,8 +1,9 @@
 """Pupil Labs Neon recordings in an EyeTracking folder.
 
 Continuous streams are raw arrays described by a sibling `.dtype` file and
-timed by an int64 nanosecond `.time` file. Blink and fixation records carry
-their own start and end timestamps.
+timed by an int64 nanosecond `.time` file. Blink records, and the shared
+fixation file, carry their own start and end timestamps. That file mixes
+saccades (event_type 0) and fixations (event_type 1).
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ def load_eye_sensors(
 # Neon scene-camera frames are 1600×1200, and gaze x/y are in those pixels.
 SCENE_WIDTH = 1600
 SCENE_HEIGHT = 1200
+# Pupil Labs writes both events into fixations ps1.raw.
+_SACCADE_EVENT = 0
+_FIXATION_EVENT = 1
 # 200 Hz gaze is denser than the video. Keep about 50 samples per second.
 _GAZE_STRIDE = 4
 
@@ -92,11 +96,7 @@ def _gaze_overlay(folder: Path, origin: float | None) -> dict[str, list[float]]:
 
 
 def _fixation_overlay(folder: Path, origin: float | None) -> dict[str, list[float]]:
-    raw_path = folder / "fixations ps1.raw"
-    dtype_path = folder / "fixations.dtype"
-    if not raw_path.is_file() or not dtype_path.is_file():
-        return {"start": [], "end": [], "x": [], "y": []}
-    raw = _read_raw(raw_path, _read_dtype(dtype_path))
+    raw = _fixation_records(folder, _FIXATION_EVENT)
     if raw is None or len(raw) == 0:
         return {"start": [], "end": [], "x": [], "y": []}
     if origin is None:
@@ -256,6 +256,7 @@ def _load_folder(
     _add(sensors, _worn_sensor(folder, origin, max_points))
     _add(sensors, _blink_sensor(folder, origin, max_points))
     _add(sensors, _fixation_sensor(folder, origin, max_points))
+    _add(sensors, _saccade_sensor(folder, origin, max_points))
     return sensors
 
 
@@ -355,35 +356,87 @@ def _blink_sensor(
         return error_sensor("eye.Blinks", "Blinks", GROUP_EYE, str(exc))
 
 
+def _fixation_records(folder: Path, event_type: int) -> np.ndarray | None:
+    """Rows of one event type from the shared fixation file."""
+    raw_path = folder / "fixations ps1.raw"
+    dtype_path = folder / "fixations.dtype"
+    if not raw_path.is_file() or not dtype_path.is_file():
+        return None
+    raw = _read_raw(raw_path, _read_dtype(dtype_path))
+    if raw is None or len(raw) == 0:
+        return None
+    if "event_type" not in raw.dtype.names:
+        return raw if event_type == _FIXATION_EVENT else raw[:0]
+    return raw[raw["event_type"] == event_type]
+
+
 def _fixation_sensor(
     folder: Path, origin: float | None, max_points: int
+) -> dict[str, Any] | None:
+    return _eye_event_sensor(
+        folder,
+        origin,
+        max_points,
+        event_type=_FIXATION_EVENT,
+        sensor_id="eye.Fixations",
+        name="Fixations",
+        fields=("duration_s", "x", "y"),
+    )
+
+
+def _saccade_sensor(
+    folder: Path, origin: float | None, max_points: int
+) -> dict[str, Any] | None:
+    return _eye_event_sensor(
+        folder,
+        origin,
+        max_points,
+        event_type=_SACCADE_EVENT,
+        sensor_id="eye.Saccades",
+        name="Saccades",
+        fields=("duration_s", "amplitude_deg", "mean_velocity", "max_velocity"),
+    )
+
+
+def _eye_event_sensor(
+    folder: Path,
+    origin: float | None,
+    max_points: int,
+    *,
+    event_type: int,
+    sensor_id: str,
+    name: str,
+    fields: tuple[str, ...],
 ) -> dict[str, Any] | None:
     raw_path = folder / "fixations ps1.raw"
     dtype_path = folder / "fixations.dtype"
     if not raw_path.is_file() or not dtype_path.is_file():
         return None
     try:
-        raw = _read_raw(raw_path, _read_dtype(dtype_path))
+        raw = _fixation_records(folder, event_type)
         if raw is None or len(raw) == 0:
             return None
         start = raw["start_timestamp_ns"].astype(np.float64)
         end = raw["end_timestamp_ns"].astype(np.float64)
+        available = {
+            "duration_s": (end - start) * 1e-9,
+            "x": raw["mean_gaze_x"].astype(np.float64),
+            "y": raw["mean_gaze_y"].astype(np.float64),
+            "amplitude_deg": raw["amplitude_angle_deg"].astype(np.float64),
+            "mean_velocity": raw["mean_velocity"].astype(np.float64),
+            "max_velocity": raw["max_velocity"].astype(np.float64),
+        }
         return build_sensor(
-            sensor_id="eye.Fixations",
-            name="Fixations",
+            sensor_id=sensor_id,
+            name=name,
             group=GROUP_EYE,
             times=_elapsed(start, origin),
-            series={
-                "duration_s": (end - start) * 1e-9,
-                "amplitude_deg": raw["amplitude_angle_deg"].astype(np.float64),
-                "mean_velocity": raw["mean_velocity"].astype(np.float64),
-                "max_velocity": raw["max_velocity"].astype(np.float64),
-            },
+            series={field: available[field] for field in fields},
             max_points=max_points,
-            source={"kind": "eye", "name": "Fixations"},
+            source={"kind": "eye", "name": name},
         )
     except Exception as exc:  # noqa: BLE001
-        return error_sensor("eye.Fixations", "Fixations", GROUP_EYE, str(exc))
+        return error_sensor(sensor_id, name, GROUP_EYE, str(exc))
 
 
 def _add(sensors: dict[str, dict[str, Any]], sensor: dict[str, Any] | None) -> None:

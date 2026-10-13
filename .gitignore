@@ -16,3 +16,9 @@ Thumbs.db
 # Recording data (keep folder, ignore contents)
 Data/*
 !Data/.gitkeep
+
+# Batch synchronization results
+sync_batch_results/
+summary.csv
+lags.csv
+recordings/
