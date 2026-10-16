@@ -8,7 +8,7 @@ such as RMR001/WALK1 are each evaluated on their own. Results are written in the
   recordings/   the full report for each session, including the lag series
 
 Run:
-  python sync_accuracy_batch.py "C:\\Users\\alire\\Box\\InmanLab\\CAPTURE Project\\Utah Task\\Raw Data"
+  python "Custom Batch Scripts\\sync_accuracy_batch.py" "D:\\path\\to\\recordings"
 """
 
 from __future__ import annotations
@@ -17,8 +17,13 @@ import argparse
 import csv
 import json
 import os
+import sys
 import traceback
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import numpy as np
 

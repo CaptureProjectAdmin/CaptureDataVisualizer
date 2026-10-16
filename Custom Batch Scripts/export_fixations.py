@@ -14,8 +14,8 @@ Results are written outside the recording tree:
   fixation_exports/<relative path>/Eye-tracking_Fixations.csv
 
 Run:
-  python export_fixations.py "D:\\path\\to\\recordings"
-  python export_fixations.py "D:\\path\\to\\recordings" --output "D:\\path\\to\\results"
+  python "Custom Batch Scripts\\export_fixations.py" "D:\\path\\to\\recordings"
+  python "Custom Batch Scripts\\export_fixations.py" "D:\\path\\to\\recordings" --output "D:\\path\\to\\results"
 """
 
 from __future__ import annotations
@@ -23,7 +23,12 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import numpy as np
 
