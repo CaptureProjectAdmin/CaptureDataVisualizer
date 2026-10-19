@@ -26,5 +26,8 @@ recordings/
 # Batch fixation exports
 fixation_exports/
 
+# Batch saccade exports
+saccade_exports/
+
 # Synchronization uncertainty report
 sync_uncertainty/
