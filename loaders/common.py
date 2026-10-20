@@ -137,17 +137,18 @@ def sensor_view(sensor: dict[str, Any], max_points: int | None = None) -> dict[s
     columns = list(sensor.get("series_columns") or [])
     times = list(sensor.get("times") or [])
     series = sensor.get("series") or {}
+    keys = list(dict.fromkeys([*columns, *[key for key in series if key not in columns]]))
     if max_points is not None and len(times) > max_points:
         idx = np.linspace(0, len(times) - 1, max_points, dtype=int)
         times = [times[int(i)] for i in idx]
         series = {
             column: [series[column][int(i)] for i in idx]
-            for column in columns
+            for column in keys
             if column in series
         }
     else:
-        series = {column: series[column] for column in columns if column in series}
-    return {
+        series = {column: series[column] for column in keys if column in series}
+    view = {
         "id": sensor.get("id"),
         "name": sensor.get("name"),
         "group": sensor.get("group"),
@@ -155,6 +156,9 @@ def sensor_view(sensor: dict[str, Any], max_points: int | None = None) -> dict[s
         "times": times,
         "series": series,
     }
+    if sensor.get("step_m") is not None:
+        view["step_m"] = float(sensor["step_m"])
+    return view
 
 
 def _finite_or_none(value: Any) -> float | None:

@@ -8,7 +8,7 @@ from typing import Any
 from loaders.common import ordered_sensors, recording_origin_seconds
 from loaders.emotibit import load_emotibit_named, load_emotibit_sensors
 from loaders.eyetracking import load_eye_named, load_eye_sensors
-from loaders.phone import load_phone_csv, load_phone_sensors
+from loaders.phone import load_phone_sensors, load_phone_stream
 
 
 def load_sensors(
@@ -31,7 +31,12 @@ def reload_sensor(
     source = sensor.get("source") or {}
     kind = source.get("kind")
     if kind == "phone":
-        return load_phone_csv(data_dir / str(source.get("file") or ""), max_points)
+        return load_phone_stream(
+            data_dir,
+            str(source.get("file") or ""),
+            str(source.get("name") or sensor.get("name") or ""),
+            max_points,
+        )
     if kind == "emotibit":
         return load_emotibit_named(data_dir, str(source.get("name") or sensor.get("name")), origin_s, max_points)
     if kind == "eye":

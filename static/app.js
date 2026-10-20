@@ -3,6 +3,8 @@ const THEME_KEY = "capture-app-theme";
 const COLLAPSED_GROUPS_KEY = "capture-app-collapsed-groups";
 const MEDIA_OPEN_KEY = "capture-app-media-open";
 const ROTATION_KEY = "capture-app-video-rotations";
+const MAP_TRACK_KEY = "capture-app-map-track";
+const FLIP_KEY = "capture-app-video-flips";
 const EYE_OVERLAY_KEY = "capture-app-eye-overlay";
 const ANNOTATE_OPEN_KEY = "capture-app-annotate-open";
 const SENSORS_OPEN_KEY = "capture-app-sensors-open";
@@ -92,13 +94,20 @@ const state = {
   playing: false,
   lastFrame: 0,
   map: null,
-  mapTrack: null,
+  mapLayers: null,
   mapMarker: null,
   locationData: null,
+  mapTrack: "clean",
+  mapView: null,
+  mapEdit: null,
+  mapDrag: null,
+  mapRedraw: null,
+  mapPedometer: null,
   syncingMedia: false,
   openMedia: null,
   mediaPlayers: new Map(),
   rotations: {},
+  flips: {},
   collapsedGroups: new Set(),
   sensorQuery: "",
   searchCollapsed: new Set(),
@@ -108,6 +117,10 @@ const state = {
   syncChart: null,
   syncReport: null,
   events: [],
+  transcript: null,
+  transcriptQuery: "",
+  transcriptActive: null,
+  transcriptPoll: 0,
   exportSelected: new Set(),
   exportMedia: new Set(),
   exportCollapsed: new Set(),
@@ -122,9 +135,23 @@ const els = {
   sensorList: document.getElementById("sensor-list"),
   sensorSearch: document.getElementById("sensor-search"),
   mediaList: document.getElementById("media-list"),
+  transcriptSearch: document.getElementById("transcript-search"),
+  transcriptStatus: document.getElementById("transcript-status"),
+  transcriptBody: document.getElementById("transcript-body"),
+  transcriptAgain: document.getElementById("transcript-again"),
   audio: document.getElementById("audio-player"),
   audioPlaceholder: document.getElementById("audio-placeholder"),
   mapSection: document.getElementById("map-section"),
+  mapLegend: document.getElementById("map-legend"),
+  mapTrackRaw: document.getElementById("map-track-raw"),
+  mapTrackClean: document.getElementById("map-track-clean"),
+  mapTrackBoth: document.getElementById("map-track-both"),
+  mapMove: document.getElementById("map-move"),
+  mapRedraw: document.getElementById("map-redraw"),
+  mapEdit: document.getElementById("map-edit"),
+  mapEditNote: document.getElementById("map-edit-note"),
+  mapEditApply: document.getElementById("map-edit-apply"),
+  mapEditCancel: document.getElementById("map-edit-cancel"),
   workspace: document.getElementById("workspace"),
   playBtn: document.getElementById("play-btn"),
   timeline: document.getElementById("timeline"),
@@ -227,8 +254,10 @@ function mediaUrl(relativePath) {
   return `/api/media/${relativePath.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+const PENDING_PATH_KEY = "capture-app-pending-path";
+
 async function fetchJson(url, options) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { cache: "no-store", ...options });
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || response.statusText);
@@ -279,6 +308,31 @@ function rotationFor(id) {
   return [0, 90, 180, 270].includes(value) ? value : 0;
 }
 
+function loadFlips() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FLIP_KEY) || "null");
+    if (parsed && typeof parsed === "object") {
+      state.flips = parsed;
+      return;
+    }
+  } catch {
+    // Ignore a damaged saved value and start with no flips.
+  }
+  state.flips = {};
+}
+
+function flipsFor(id) {
+  const saved = state.flips[id];
+  return {
+    h: Boolean(saved && typeof saved === "object" && saved.h),
+    v: Boolean(saved && typeof saved === "object" && saved.v),
+  };
+}
+
+function saveFlips() {
+  localStorage.setItem(FLIP_KEY, JSON.stringify(state.flips));
+}
+
 function playerElement(player) {
   return player?.video || player?.audio || null;
 }
@@ -314,8 +368,23 @@ function updateMuteButton(player) {
 function applyRotation(player) {
   if (!player.stage) return;
   const rotation = rotationFor(player.id);
-  player.stage.className = `video-stage rotate-${rotation}`;
+  const flips = flipsFor(player.id);
+  player.stage.className = "video-stage";
+  const transform = `rotate(${rotation}deg) scale(${flips.h ? -1 : 1}, ${flips.v ? -1 : 1})`;
+  for (const element of [player.video, player.overlayCanvas]) {
+    if (element) element.style.transform = transform;
+  }
   if (player.rotationLabel) player.rotationLabel.textContent = `${rotation}°`;
+  player.flipH?.setAttribute("aria-pressed", flips.h ? "true" : "false");
+  player.flipV?.setAttribute("aria-pressed", flips.v ? "true" : "false");
+}
+
+function toggleFlip(player, axis) {
+  const flips = flipsFor(player.id);
+  flips[axis] = !flips[axis];
+  state.flips[player.id] = flips;
+  saveFlips();
+  applyRotation(player);
 }
 
 function rotatePlayer(player, delta) {
@@ -391,6 +460,23 @@ function setMediaOpen(id, open) {
   if (checkbox) checkbox.checked = open;
 }
 
+function setTranscriptOpen(open) {
+  ensureOpenMedia();
+  if (open) state.openMedia.add("transcript");
+  else state.openMedia.delete("transcript");
+  localStorage.setItem(MEDIA_OPEN_KEY, JSON.stringify([...state.openMedia]));
+  applyTranscriptOpen();
+  const checkbox = els.mediaList?.querySelector('input[data-media-id="transcript"]');
+  if (checkbox) checkbox.checked = open;
+}
+
+function applyTranscriptOpen() {
+  const panel = document.getElementById("transcript-panel");
+  if (!panel) return;
+  panel.hidden = !state.openMedia.has("transcript");
+  PanelLayout.placeTranscript();
+}
+
 function renderMediaToggles(items) {
   ensureOpenMedia();
   if (!els.mediaList) return;
@@ -400,7 +486,6 @@ function renderMediaToggles(items) {
     empty.className = "media-status";
     empty.textContent = "No media files found in this recording";
     els.mediaList.append(empty);
-    return;
   }
   for (const item of items) {
     const label = document.createElement("label");
@@ -416,6 +501,18 @@ function renderMediaToggles(items) {
     label.append(checkbox, name);
     els.mediaList.append(label);
   }
+  const transcriptLabel = document.createElement("label");
+  transcriptLabel.className = "sensor-item";
+  const transcriptBox = document.createElement("input");
+  transcriptBox.type = "checkbox";
+  transcriptBox.dataset.mediaId = "transcript";
+  transcriptBox.checked = state.openMedia.has("transcript");
+  transcriptBox.addEventListener("change", () => setTranscriptOpen(transcriptBox.checked));
+  const transcriptName = document.createElement("span");
+  transcriptName.textContent = "Transcript";
+  transcriptLabel.append(transcriptBox, transcriptName);
+  els.mediaList.append(transcriptLabel);
+  applyTranscriptOpen();
 }
 
 function loadEyeOverlayToggles() {
@@ -666,11 +763,21 @@ function createVideoPanel(item) {
   rotateRight.type = "button";
   rotateRight.title = "Rotate 90° clockwise";
   rotateRight.textContent = "↻ 90°";
-  rotate.append(rotateLeft, rotationLabel, rotateRight);
+  const flipH = document.createElement("button");
+  flipH.type = "button";
+  flipH.title = "Flip horizontal";
+  flipH.textContent = "Flip H";
+  flipH.setAttribute("aria-pressed", "false");
+  const flipV = document.createElement("button");
+  flipV.type = "button";
+  flipV.title = "Flip vertical";
+  flipV.textContent = "Flip V";
+  flipV.setAttribute("aria-pressed", "false");
+  rotate.append(rotateLeft, rotationLabel, rotateRight, flipH, flipV);
   header.append(toolbar, rotate);
 
   const stage = document.createElement("div");
-  stage.className = "video-stage rotate-0";
+  stage.className = "video-stage";
   const video = document.createElement("video");
   video.className = "video-player";
   video.playsInline = true;
@@ -746,6 +853,8 @@ function createVideoPanel(item) {
     volume,
     fullscreenBtn,
     rotationLabel,
+    flipH,
+    flipV,
     overlayCanvas,
     gazeBtn,
     fixationBtn,
@@ -756,6 +865,8 @@ function createVideoPanel(item) {
 
   rotateLeft.addEventListener("click", () => rotatePlayer(player, -90));
   rotateRight.addEventListener("click", () => rotatePlayer(player, 90));
+  flipH.addEventListener("click", () => toggleFlip(player, "h"));
+  flipV.addEventListener("click", () => toggleFlip(player, "v"));
   playBtn.addEventListener("click", togglePlay);
   muteBtn.addEventListener("click", () => {
     video.muted = !video.muted;
@@ -805,6 +916,7 @@ function registerAudio(item) {
 function configureMedia(session) {
   ensureOpenMedia();
   loadRotations();
+  loadFlips();
   els.workspace?.querySelectorAll(":scope > .video-card").forEach((panel) => panel.remove());
   state.mediaPlayers.clear();
 
@@ -938,27 +1050,27 @@ function renderSensorList(session) {
     items.hidden = collapsed;
 
     for (const sensor of group.sensors) {
-      const label = document.createElement("label");
-      label.className = `sensor-item${sensor.error ? " disabled" : ""}`;
+    const label = document.createElement("label");
+    label.className = `sensor-item${sensor.error ? " disabled" : ""}`;
 
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.disabled = Boolean(sensor.error);
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.disabled = Boolean(sensor.error);
       checkbox.checked = state.selected.has(sensor.id) && !sensor.error;
-      checkbox.addEventListener("change", async () => {
+    checkbox.addEventListener("change", async () => {
         if (checkbox.checked) state.selected.add(sensor.id);
         else state.selected.delete(sensor.id);
-        await refreshCharts();
-      });
+      await refreshCharts();
+    });
 
-      const name = document.createElement("span");
+    const name = document.createElement("span");
       appendHighlighted(name, sensor.name, query);
 
-      const meta = document.createElement("small");
-      if (sensor.error) meta.textContent = "error";
-      else meta.textContent = sensor.kind === "map" ? "map" : `${sensor.row_count.toLocaleString()} pts`;
+    const meta = document.createElement("small");
+    if (sensor.error) meta.textContent = "error";
+    else meta.textContent = sensor.kind === "map" ? "map" : `${sensor.row_count.toLocaleString()} pts`;
 
-      label.append(checkbox, name, meta);
+    label.append(checkbox, name, meta);
       items.append(label);
     }
 
@@ -988,9 +1100,15 @@ function setDurationUi(duration) {
   }
 }
 
+const PLAY_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.67 4 20.67 12 7.67 20Z"/></svg>`;
+const PAUSE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7.4" y="4" width="3.2" height="16" rx="0.5"/><rect x="13.4" y="4" width="3.2" height="16" rx="0.5"/></svg>`;
+
 function updatePlayButtons() {
   const symbol = state.playing ? "❚❚" : "▶";
-  els.playBtn.textContent = symbol;
+  if (els.playBtn) {
+    els.playBtn.innerHTML = state.playing ? PAUSE_ICON : PLAY_ICON;
+    els.playBtn.setAttribute("aria-label", state.playing ? "Pause" : "Play");
+  }
   for (const player of state.mediaPlayers.values()) {
     if (!player.playBtn) continue;
     player.playBtn.textContent = symbol;
@@ -1173,7 +1291,7 @@ function buildChartCard(sensorName, payload) {
   actions.append(zoomBtn, windowLabel, fitBtn);
   toolbar.append(title, actions);
 
-  const columns = payload.columns || Object.keys(payload.series);
+  const columns = (payload.columns || Object.keys(payload.series)).filter((col) => col !== "interpolated");
   const toggles = document.createElement("div");
   toggles.className = "series-toggles";
   columns.forEach((col, idx) => {
@@ -1214,6 +1332,12 @@ function buildChartCard(sensorName, payload) {
   values.id = valueElementId(sensorName);
 
   card.append(toolbar, toggles, stage, values);
+  if ((payload.series.interpolated || []).some((value) => Number(value) === 1)) {
+    const note = document.createElement("p");
+    note.className = "chart-note";
+    note.textContent = "Open circles are interpolated samples.";
+    card.append(note);
+  }
   els.workspace.append(card);
   PanelLayout.decorate(card);
 
@@ -1264,6 +1388,7 @@ function buildChartCard(sensorName, payload) {
       hooks: {
         draw: [
           (u) => {
+            drawInterpolatedMarks(u, payload, columns);
             const x = u.valToPos(state.currentTime, "x", true);
             if (!Number.isFinite(x)) return;
             const left = u.bbox.left;
@@ -1298,7 +1423,7 @@ function updateChartValues(sensorName, payload) {
   if (!el || !payload?.times?.length) return;
   const view = chartView(sensorName);
   const idx = nearestIndex(payload.times, state.currentTime);
-  const columns = payload.columns || [];
+  const columns = (payload.columns || []).filter((col) => col !== "interpolated");
   el.replaceChildren(
     ...columns.map((col, i) => {
       const span = document.createElement("span");
@@ -1308,15 +1433,563 @@ function updateChartValues(sensorName, payload) {
       const strong = document.createElement("strong");
       strong.textContent = val == null ? "—" : Number(val).toFixed(3);
       span.append(`${col}: `, strong);
+      if (col === "Velocity" && Number(payload.series.interpolated?.[idx]) === 1) {
+        span.append(" interpolated");
+      }
       return span;
     }),
   );
+}
+
+function drawInterpolatedMarks(chart, payload, columns) {
+  const flags = payload.series?.interpolated;
+  const valueKey = columns.includes("Velocity") ? "Velocity" : columns[0];
+  if (!flags || !valueKey || chartView(payload.id || "").hidden?.has(valueKey)) return;
+  const values = payload.series[valueKey];
+  if (!values) return;
+  const ctx = chart.ctx;
+  ctx.save();
+  ctx.strokeStyle = "#c45c26";
+  ctx.lineWidth = 1.5;
+  const left = chart.bbox.left;
+  const right = left + chart.bbox.width;
+  const top = chart.bbox.top;
+  const bottom = top + chart.bbox.height;
+  for (let index = 0; index < payload.times.length; index += 1) {
+    if (Number(flags[index]) !== 1 || !Number.isFinite(values[index])) continue;
+    const x = chart.valToPos(payload.times[index], "x", true);
+    const y = chart.valToPos(values[index], "y", true);
+    if (x < left || x > right || y < top || y > bottom) continue;
+    ctx.beginPath();
+    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function selectedMapSensor() {
   return (state.session?.sensors || []).find(
     (sensor) => sensor.kind === "map" && state.selected.has(sensor.id) && !sensor.error,
   );
+}
+
+const SPEED_STOPS = [
+  [0, [138, 164, 168]],
+  [0.5, [40, 126, 143]],
+  [1, [196, 92, 38]],
+];
+
+function speedColor(speed, min, max) {
+  const span = max - min;
+  const unit = span <= 0 ? 0.5 : Math.min(1, Math.max(0, (speed - min) / span));
+  let lower = SPEED_STOPS[0];
+  let upper = SPEED_STOPS[SPEED_STOPS.length - 1];
+  for (let index = 1; index < SPEED_STOPS.length; index += 1) {
+    if (unit <= SPEED_STOPS[index][0]) {
+      lower = SPEED_STOPS[index - 1];
+      upper = SPEED_STOPS[index];
+      break;
+    }
+  }
+  const local = upper[0] === lower[0] ? 0 : (unit - lower[0]) / (upper[0] - lower[0]);
+  const rgb = lower[1].map((channel, index) => Math.round(channel + (upper[1][index] - channel) * local));
+  return `rgb(${rgb.join(", ")})`;
+}
+
+function bearingIcon(bearing) {
+  const rotation = Number.isFinite(bearing) ? bearing : 0;
+  return L.divIcon({
+    className: "map-bearing-icon",
+    html: `<svg class="map-bearing-arrow" viewBox="0 0 24 24" style="transform:rotate(${rotation}deg)" aria-hidden="true"><path d="M12 2.5 19 20.5 12 16.5 5 20.5Z" fill="#1c3d44" stroke="#ffffff" stroke-width="1.4"></path></svg>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+}
+
+function placeBearingMarker(lat, lon, bearing) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const here = [lat, lon];
+  if (!state.mapMarker) {
+    state.mapMarker = L.marker(here, { icon: bearingIcon(bearing), interactive: false, zIndexOffset: 1000 }).addTo(state.map);
+    return;
+  }
+  state.mapMarker.setLatLng(here);
+  state.mapMarker.setIcon(bearingIcon(bearing));
+}
+
+function renderSpeedLegend(min, max, hasInterpolated, showRecorded) {
+  if (!els.mapLegend) return;
+  els.mapLegend.hidden = false;
+  els.mapLegend.replaceChildren();
+  const top = document.createElement("span");
+  top.textContent = max.toFixed(1);
+  const bar = document.createElement("div");
+  bar.className = "map-legend-bar";
+  bar.style.background = `linear-gradient(to top, ${speedColor(min, min, max)}, ${speedColor((min + max) / 2, min, max)}, ${speedColor(max, min, max)})`;
+  const bottom = document.createElement("span");
+  bottom.textContent = min.toFixed(1);
+  const unit = document.createElement("span");
+  unit.textContent = "m/s";
+  els.mapLegend.append(top, bar, bottom, unit);
+  if (showRecorded) {
+    const swatch = document.createElement("span");
+    swatch.className = "map-legend-swatch";
+    const recorded = document.createElement("span");
+    recorded.className = "map-legend-note";
+    recorded.textContent = "Gray line is recorded";
+    els.mapLegend.append(swatch, recorded);
+  }
+  if (hasInterpolated && state.mapTrack !== "raw") {
+    const note = document.createElement("span");
+    note.className = "map-legend-note";
+    note.textContent = "Dashed line is interpolated";
+    els.mapLegend.append(note);
+  }
+  if (state.mapTrack !== "raw" && state.mapView?.samples?.some((sample) => sample.impossible)) {
+    const blocked = document.createElement("span");
+    blocked.className = "map-legend-note";
+    blocked.textContent = "Red line jumps a building";
+    els.mapLegend.append(blocked);
+  }
+}
+
+function speedSegments(samples, flatColor) {
+  const segments = [];
+  const minSpeed = state.mapView?.minSpeed ?? 0;
+  const maxSpeed = state.mapView?.maxSpeed ?? 1;
+  for (let index = 1; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const span = maxSpeed - minSpeed;
+    const unit = span <= 0 ? 0 : (sample.speed - minSpeed) / span;
+    const binned = minSpeed + (Math.round(Math.min(1, Math.max(0, unit)) * 8) / 8) * span;
+    const color = flatColor || speedColor(binned, minSpeed, maxSpeed);
+    const interpolated = flatColor ? false : sample.interpolated || samples[index - 1].interpolated;
+    const previous = segments[segments.length - 1];
+    if (previous && previous.color === color && previous.interpolated === interpolated) {
+      previous.points.push([sample.lat, sample.lon]);
+    } else {
+      segments.push({
+        color,
+        interpolated,
+        points: [[samples[index - 1].lat, samples[index - 1].lon], [sample.lat, sample.lon]],
+      });
+    }
+  }
+  return segments;
+}
+
+function drawTrack(samples, { flatColor = "" } = {}) {
+  if (!state.mapLayers || samples.length < 2) return;
+  for (const segment of speedSegments(samples, flatColor)) {
+    L.polyline(segment.points, {
+      color: segment.color,
+      weight: segment.interpolated ? 3 : 4,
+      opacity: segment.interpolated ? 0.85 : 1,
+      dashArray: segment.interpolated ? "2 8" : null,
+    }).addTo(state.mapLayers);
+  }
+}
+
+function renderMapPath({ fit = false } = {}) {
+  const view = state.mapView;
+  if (!state.map || !state.mapLayers || !view) return;
+  state.mapLayers.clearLayers();
+  const showRaw = state.mapTrack === "raw" || state.mapTrack === "both";
+  const showClean = state.mapTrack !== "raw";
+  const rawSamples = showRaw
+    ? view.samples
+        .filter((sample) => Number.isFinite(sample.rawLat) && Number.isFinite(sample.rawLon))
+        .map((sample) => ({ lat: sample.rawLat, lon: sample.rawLon, speed: sample.speed, interpolated: false }))
+    : [];
+  const cleanSamples = showClean
+    ? view.samples.map((sample) => ({
+        lat: sample.lat,
+        lon: sample.lon,
+        speed: sample.speed,
+        interpolated: sample.interpolated,
+      }))
+    : [];
+  if (showRaw) drawTrack(rawSamples, { flatColor: state.mapTrack === "both" ? "#4a5560" : "" });
+  if (showClean) drawTrack(cleanSamples);
+  if (showClean) drawImpossible(view.samples);
+  const boundsSource = state.mapTrack === "raw" ? rawSamples : state.mapTrack === "clean" ? cleanSamples : view.samples.flatMap((sample) => {
+    const points = [[sample.lat, sample.lon]];
+    if (Number.isFinite(sample.rawLat) && Number.isFinite(sample.rawLon)) points.push([sample.rawLat, sample.rawLon]);
+    return points;
+  });
+  const boundPoints = state.mapTrack === "both"
+    ? boundsSource
+    : boundsSource.map((sample) => [sample.lat, sample.lon]);
+  if (fit && boundPoints.length) state.map.fitBounds(boundPoints, { padding: [24, 24] });
+  renderSpeedLegend(
+    view.minSpeed,
+    view.maxSpeed,
+    view.samples.some((sample) => sample.interpolated),
+    state.mapTrack === "both",
+  );
+  placeMapMarker();
+}
+
+function placeMapMarker() {
+  if (!state.locationData) return;
+  const rawLat = state.locationData.series.latitude_raw;
+  const rawLon = state.locationData.series.longitude_raw;
+  const useRaw = state.mapTrack === "raw" && rawLat?.length && rawLon?.length;
+  const latSeries = useRaw ? rawLat : state.locationData.series.latitude;
+  const lonSeries = useRaw ? rawLon : state.locationData.series.longitude;
+  const bearing = state.locationData.series.bearing || [];
+  const idx = nearestIndex(state.locationData.times, state.currentTime);
+  placeBearingMarker(latSeries?.[idx], lonSeries?.[idx], bearing[idx]);
+}
+
+function syncMapTrackButtons() {
+  const pressed = {
+    raw: state.mapTrack === "raw",
+    clean: state.mapTrack === "clean",
+    both: state.mapTrack === "both",
+  };
+  els.mapTrackRaw?.setAttribute("aria-pressed", pressed.raw ? "true" : "false");
+  els.mapTrackClean?.setAttribute("aria-pressed", pressed.clean ? "true" : "false");
+  els.mapTrackBoth?.setAttribute("aria-pressed", pressed.both ? "true" : "false");
+}
+
+function setMapTrack(mode) {
+  if (!["raw", "clean", "both"].includes(mode)) return;
+  state.mapTrack = mode;
+  localStorage.setItem(MAP_TRACK_KEY, mode);
+  syncMapTrackButtons();
+  renderMapPath({ fit: true });
+}
+
+function loadMapTrack() {
+  const saved = localStorage.getItem(MAP_TRACK_KEY);
+  state.mapTrack = ["raw", "clean", "both"].includes(saved) ? saved : "clean";
+  syncMapTrackButtons();
+}
+
+function metersBetween(lat1, lon1, lat2, lon2) {
+  const radius = 6_371_000;
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const dphi = ((lat2 - lat1) * Math.PI) / 180;
+  const dlambda = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(dphi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  return 2 * radius * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+function stepsAt(time) {
+  const pedometer = state.mapPedometer;
+  const times = pedometer?.times || [];
+  const steps = pedometer?.series?.steps || [];
+  if (!times.length) return 0;
+  if (time <= times[0]) return Number(steps[0]) || 0;
+  if (time >= times[times.length - 1]) return Number(steps[times.length - 1]) || 0;
+  let low = 0;
+  let high = times.length - 1;
+  while (high - low > 1) {
+    const mid = Math.floor((low + high) / 2);
+    if (times[mid] <= time) low = mid;
+    else high = mid;
+  }
+  const span = times[high] - times[low];
+  const weight = span <= 0 ? 0 : (time - times[low]) / span;
+  return (Number(steps[low]) || 0) + weight * ((Number(steps[high]) || 0) - (Number(steps[low]) || 0));
+}
+
+function stepsBetween(start, end) {
+  return Math.max(0, stepsAt(end) - stepsAt(start));
+}
+
+function drawImpossible(samples) {
+  let points = [];
+  const flush = () => {
+    if (points.length > 1) {
+      L.polyline(points, { color: "#9b2335", weight: 5, opacity: 0.9 }).addTo(state.mapLayers);
+    }
+    points = [];
+  };
+  for (let index = 1; index < samples.length; index += 1) {
+    if (samples[index].impossible || samples[index - 1].impossible) {
+      if (!points.length) points.push([samples[index - 1].lat, samples[index - 1].lon]);
+      points.push([samples[index].lat, samples[index].lon]);
+    } else flush();
+  }
+  flush();
+}
+
+function setMapEdit(mode) {
+  finishSegmentDrag();
+  clearRedrawMarkers();
+  state.mapEdit = mode;
+  state.mapRedraw = mode === "redraw" ? { start: null, end: null, points: [] } : null;
+  els.mapMove?.setAttribute("aria-pressed", mode === "move" ? "true" : "false");
+  els.mapRedraw?.setAttribute("aria-pressed", mode === "redraw" ? "true" : "false");
+  els.mapSection?.classList.toggle("is-editing", Boolean(mode));
+  if (els.mapEdit) els.mapEdit.hidden = !mode;
+  if (els.mapEditApply) els.mapEditApply.hidden = mode !== "redraw";
+  updateRedrawNote();
+}
+
+function updateRedrawNote() {
+  if (els.mapEditNote) {
+    if (state.mapEdit === "move") {
+      els.mapEditNote.textContent = "Drag a point. That straight stretch moves with it, and the ends stay joined.";
+    } else if (!state.mapRedraw) {
+      els.mapEditNote.textContent = "";
+    } else if (state.mapRedraw.start == null) {
+      els.mapEditNote.textContent = "Click the path where the bad stretch starts.";
+    } else if (state.mapRedraw.end == null) {
+      els.mapEditNote.textContent = "Click the path where the bad stretch ends.";
+    } else {
+      const redraw = state.mapRedraw;
+      const samples = state.mapView?.samples || [];
+      const walked = stepsBetween(samples[redraw.start].time, samples[redraw.end].time) * (state.stepM || 0.75);
+      const route = redrawRoute(redraw);
+      let drawn = 0;
+      for (let index = 1; index < route.length; index += 1) {
+        drawn += metersBetween(route[index - 1][0], route[index - 1][1], route[index][0], route[index][1]);
+      }
+      els.mapEditNote.textContent = `Pedometer ${walked.toFixed(0)} m. Drawn route ${drawn.toFixed(0)} m. Click the map to add a corner.`;
+    }
+  }
+  const redraw = state.mapRedraw;
+  if (els.mapEditApply) els.mapEditApply.disabled = !(redraw && redraw.end != null && redraw.points.length >= 1);
+}
+
+function redrawRoute(redraw) {
+  const samples = state.mapView.samples;
+  return [
+    [samples[redraw.start].lat, samples[redraw.start].lon],
+    ...redraw.points.map((point) => [point.lat, point.lon]),
+    [samples[redraw.end].lat, samples[redraw.end].lon],
+  ];
+}
+
+function clearRedrawMarkers() {
+  for (const marker of state.mapRedraw?.markers || []) state.map?.removeLayer(marker);
+  if (state.mapRedraw) state.mapRedraw.markers = [];
+}
+
+function sampleNear(containerPoint, pixels) {
+  if (!state.map || !state.mapView) return null;
+  let best = null;
+  let bestDistance = pixels;
+  for (let index = 0; index < state.mapView.samples.length; index += 1) {
+    const sample = state.mapView.samples[index];
+    const point = state.map.latLngToContainerPoint([sample.lat, sample.lon]);
+    const distance = Math.hypot(point.x - containerPoint.x, point.y - containerPoint.y);
+    if (distance < bestDistance) {
+      best = index;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function bindMapEdits() {
+  state.map.on("mousedown", (event) => {
+    if (state.mapEdit !== "move" || state.mapTrack === "raw") return;
+    const hit = sampleNear(event.containerPoint, 18);
+    if (hit == null) return;
+    L.DomEvent.stop(event.originalEvent);
+    state.map.dragging.disable();
+    state.mapDrag = {
+      segment: state.mapView.samples[hit].segment,
+      start: event.latlng,
+      base: state.mapView.samples.map((sample) => ({ lat: sample.lat, lon: sample.lon })),
+    };
+  });
+  state.map.on("mousemove", (event) => {
+    if (!state.mapDrag) return;
+    shiftSegment(
+      state.mapDrag.segment,
+      event.latlng.lat - state.mapDrag.start.lat,
+      event.latlng.lng - state.mapDrag.start.lng,
+      state.mapDrag.base,
+    );
+    renderMapPath({ fit: false });
+  });
+  state.map.on("mouseup", finishSegmentDrag);
+  document.addEventListener("mouseup", finishSegmentDrag);
+  state.map.on("click", (event) => {
+    if (state.mapEdit !== "redraw" || state.mapDrag) return;
+    const hit = sampleNear(event.containerPoint, 16);
+    const redraw = state.mapRedraw;
+    if (!redraw) return;
+    if (redraw.start == null || redraw.end == null) {
+      if (hit == null) return;
+      if (redraw.start == null) redraw.start = hit;
+      else if (hit !== redraw.start) {
+        redraw.end = Math.max(hit, redraw.start);
+        redraw.start = Math.min(hit, redraw.start);
+      }
+      updateRedrawNote();
+      return;
+    }
+    const marker = L.circleMarker(event.latlng, {
+      radius: 6,
+      color: "#9b2335",
+      weight: 2,
+      fillColor: "#ffffff",
+      fillOpacity: 1,
+    }).addTo(state.map);
+    redraw.markers = redraw.markers || [];
+    redraw.markers.push(marker);
+    redraw.points.push({ lat: event.latlng.lat, lon: event.latlng.lng });
+    updateRedrawNote();
+  });
+}
+
+function shiftSegment(segment, dLat, dLon, base) {
+  const members = [];
+  state.mapView.samples.forEach((sample, index) => {
+    if (sample.segment === segment) members.push(index);
+  });
+  if (members.length < 2) return;
+  const first = state.mapView.samples[members[0]];
+  const last = state.mapView.samples[members[members.length - 1]];
+  const blend = 3;
+  for (const index of members) {
+    const sample = state.mapView.samples[index];
+    let edge = 1;
+    if (sample.time - first.time < blend) edge = Math.min(edge, (sample.time - first.time) / blend);
+    if (last.time - sample.time < blend) edge = Math.min(edge, (last.time - sample.time) / blend);
+    const weight = 0.5 - 0.5 * Math.cos(Math.PI * Math.max(0, Math.min(1, edge)));
+    sample.lat = base[index].lat + dLat * weight;
+    sample.lon = base[index].lon + dLon * weight;
+  }
+}
+
+function finishSegmentDrag() {
+  if (!state.mapDrag) return;
+  state.map?.dragging.enable();
+  const segment = state.mapDrag.segment;
+  const base = state.mapDrag.base;
+  state.mapDrag = null;
+  let moved = false;
+  for (let index = 0; index < state.mapView.samples.length; index += 1) {
+    const sample = state.mapView.samples[index];
+    if (sample.segment !== segment) continue;
+    if (Math.abs(sample.lat - base[index].lat) + Math.abs(sample.lon - base[index].lon) < 1e-8) continue;
+    sample.interpolated = true;
+    sample.impossible = false;
+    moved = true;
+  }
+  if (moved) reconcileEditedTrack();
+  renderMapPath({ fit: false });
+}
+
+function pointAlong(route, distance) {
+  let walked = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    const span = metersBetween(route[index - 1][0], route[index - 1][1], route[index][0], route[index][1]);
+    if (walked + span >= distance || index === route.length - 1) {
+      const weight = span <= 0 ? 0 : Math.max(0, Math.min(1, (distance - walked) / span));
+      return {
+        lat: route[index - 1][0] + (route[index][0] - route[index - 1][0]) * weight,
+        lon: route[index - 1][1] + (route[index][1] - route[index - 1][1]) * weight,
+      };
+    }
+    walked += span;
+  }
+  return { lat: route[0][0], lon: route[0][1] };
+}
+
+function applyRedraw() {
+  const redraw = state.mapRedraw;
+  const samples = state.mapView?.samples;
+  if (!redraw || redraw.start == null || redraw.end == null || redraw.points.length < 1 || !samples) return;
+  const route = redrawRoute(redraw);
+  let routeLength = 0;
+  for (let index = 1; index < route.length; index += 1) {
+    routeLength += metersBetween(route[index - 1][0], route[index - 1][1], route[index][0], route[index][1]);
+  }
+  const start = samples[redraw.start];
+  const end = samples[redraw.end];
+  const walked = stepsBetween(start.time, end.time);
+  for (let index = redraw.start + 1; index < redraw.end; index += 1) {
+    const fraction = walked > 0.5
+      ? stepsBetween(start.time, samples[index].time) / walked
+      : (samples[index].time - start.time) / Math.max(0.001, end.time - start.time);
+    const placed = pointAlong(route, fraction * routeLength);
+    samples[index].lat = placed.lat;
+    samples[index].lon = placed.lon;
+    samples[index].interpolated = true;
+    samples[index].impossible = false;
+  }
+  const snapshot = samples.map((sample) => ({ lat: sample.lat, lon: sample.lon }));
+  for (let index = redraw.start + 1; index < redraw.end; index += 1) {
+    samples[index].lat = (snapshot[index - 1].lat + 2 * snapshot[index].lat + snapshot[index + 1].lat) / 4;
+    samples[index].lon = (snapshot[index - 1].lon + 2 * snapshot[index].lon + snapshot[index + 1].lon) / 4;
+  }
+  for (const corner of redraw.points) {
+    let nearest = redraw.start;
+    let best = Infinity;
+    for (let index = redraw.start; index <= redraw.end; index += 1) {
+      const distance = metersBetween(samples[index].lat, samples[index].lon, corner.lat, corner.lon);
+      if (distance < best) {
+        best = distance;
+        nearest = index;
+      }
+    }
+    samples[nearest].lat = corner.lat;
+    samples[nearest].lon = corner.lon;
+  }
+  samples[redraw.start].impossible = false;
+  samples[redraw.end].impossible = false;
+  reconcileEditedTrack();
+  setMapEdit(null);
+  renderMapPath({ fit: false });
+}
+
+function reconcileEditedTrack() {
+  const samples = state.mapView?.samples || [];
+  const stepM = state.stepM || 0.75;
+  const hasSteps = Boolean(state.mapPedometer?.times?.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const previous = samples[Math.max(0, index - 1)];
+    const dt = Math.max(sample.time - previous.time, 1e-3);
+    const pathSpeed = index === 0 ? 0 : metersBetween(previous.lat, previous.lon, sample.lat, sample.lon) / dt;
+    const pedometerSpeed = hasSteps ? (stepsBetween(sample.time - 2, sample.time + 2) * stepM) / 4 : pathSpeed;
+    const inconsistent = Math.abs(pathSpeed - pedometerSpeed) > Math.max(0.45, 0.35 * Math.max(pedometerSpeed, pathSpeed));
+    sample.speedAdjusted = false;
+    if (inconsistent) {
+      sample.speed = pedometerSpeed;
+      sample.speedInterpolated = true;
+      sample.speedAdjusted = true;
+      if (Number.isFinite(sample.heading)) sample.bearing = ((sample.heading * 180) / Math.PI + 360) % 360;
+    } else if (sample.interpolated) {
+      sample.speed = pathSpeed;
+      sample.speedInterpolated = true;
+      sample.speedAdjusted = true;
+    }
+  }
+  const location = state.locationData;
+  const velocity = state.sensorData.get("phone.Velocity");
+  for (const sample of samples) {
+    if (location) {
+      location.series.latitude[sample.index] = sample.lat;
+      location.series.longitude[sample.index] = sample.lon;
+      location.series.bearing[sample.index] = sample.bearing;
+      location.series.interpolated[sample.index] = sample.interpolated ? 1 : 0;
+      if (location.series.impossible) location.series.impossible[sample.index] = sample.impossible ? 1 : 0;
+    }
+    if (velocity && sample.speedAdjusted) {
+      velocity.series.Velocity[sample.index] = sample.speed;
+      velocity.series.interpolated[sample.index] = sample.speedInterpolated ? 1 : 0;
+    }
+  }
+  const speeds = samples.map((sample) => sample.speed).filter((speed) => Number.isFinite(speed));
+  if (state.mapView && speeds.length) {
+    state.mapView.minSpeed = Math.min(...speeds);
+    state.mapView.maxSpeed = Math.max(...speeds);
+  }
+  const chart = state.charts.get("phone.Velocity");
+  if (velocity && chart) {
+    const columns = (velocity.columns || []).filter((column) => column !== "interpolated");
+    chart.setData([velocity.times, ...columns.map((column) => velocity.series[column] || [])]);
+  }
 }
 
 async function setupMap() {
@@ -1327,16 +2000,44 @@ async function setupMap() {
   }
 
   const payload = await loadSensorData(mapSensor.id);
+  const velocityMeta = (state.session?.sensors || []).find((sensor) => sensor.id === "phone.Velocity" && !sensor.error);
+  const velocity = velocityMeta ? await loadSensorData(velocityMeta.id) : null;
   state.locationData = payload;
   els.mapSection.hidden = false;
 
   const lat = payload.series.latitude || [];
   const lon = payload.series.longitude || [];
-  const points = lat
-    .map((la, i) => [la, lon[i]])
-    .filter(([la, lo]) => Number.isFinite(la) && Number.isFinite(lo));
+  const rawLat = payload.series.latitude_raw || [];
+  const rawLon = payload.series.longitude_raw || [];
+  const bearing = payload.series.bearing || [];
+  const flags = payload.series.interpolated || [];
+  const segments = payload.series.segment || [];
+  const impossible = payload.series.impossible || [];
+  const headings = payload.series.heading || [];
+  const speeds = velocity?.series?.Velocity || [];
+  const pedometerMeta = (state.session?.sensors || []).find((sensor) => sensor.id === "phone.Pedometer" && !sensor.error);
+  state.mapPedometer = pedometerMeta ? await loadSensorData(pedometerMeta.id) : null;
+  state.stepM = Number(payload.step_m) || 0.75;
+  const samples = [];
+  for (let index = 0; index < lat.length; index += 1) {
+    if (!Number.isFinite(lat[index]) || !Number.isFinite(lon[index])) continue;
+    samples.push({
+      index,
+      time: payload.times[index],
+      lat: lat[index],
+      lon: lon[index],
+      rawLat: Number.isFinite(rawLat[index]) ? rawLat[index] : lat[index],
+      rawLon: Number.isFinite(rawLon[index]) ? rawLon[index] : lon[index],
+      bearing: bearing[index],
+      heading: Number(headings[index]),
+      segment: Number(segments[index]) || 0,
+      speed: Number.isFinite(speeds[index]) ? speeds[index] : 0,
+      interpolated: Number(flags[index]) === 1,
+      impossible: Number(impossible[index]) === 1,
+    });
+  }
 
-  if (!points.length) {
+  if (!samples.length) {
     els.mapSection.hidden = true;
     return;
   }
@@ -1346,23 +2047,22 @@ async function setupMap() {
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: "&copy; OpenStreetMap",
     }).addTo(state.map);
+    state.mapLayers = L.layerGroup().addTo(state.map);
+    bindMapEdits();
+  }
+  state.mapLayers.clearLayers();
+  if (state.mapMarker) {
+    state.map.removeLayer(state.mapMarker);
+    state.mapMarker = null;
   }
 
-  if (state.mapTrack) state.map.removeLayer(state.mapTrack);
-  if (state.mapMarker) state.map.removeLayer(state.mapMarker);
-
-  state.mapTrack = L.polyline(points, { color: SERIES_COLORS[0], weight: 4 }).addTo(state.map);
-  state.map.fitBounds(state.mapTrack.getBounds(), { padding: [24, 24] });
-
-  const idx = nearestIndex(payload.times, state.currentTime);
-  const markerPoint = [lat[idx], lon[idx]];
-  state.mapMarker = L.circleMarker(markerPoint, {
-    radius: 8,
-    color: "#f8faf7",
-    weight: 2,
-    fillColor: SERIES_COLORS[1],
-    fillOpacity: 0.95,
-  }).addTo(state.map);
+  const finiteSpeeds = samples.map((sample) => sample.speed).filter((speed) => Number.isFinite(speed));
+  state.mapView = {
+    samples,
+    minSpeed: finiteSpeeds.length ? Math.min(...finiteSpeeds) : 0,
+    maxSpeed: finiteSpeeds.length ? Math.max(...finiteSpeeds) : 1,
+  };
+  renderMapPath({ fit: true });
 }
 
 async function refreshCharts() {
@@ -1398,7 +2098,7 @@ function setCurrentTime(t, { source = null } = {}) {
   state.currentTime = clamped;
   updateTimelineUi(clamped);
 
-  state.syncingMedia = true;
+    state.syncingMedia = true;
   for (const element of openMediaElements()) {
     if (element === source || element.readyState < 1) continue;
     if (Math.abs(element.currentTime - clamped) > 0.15) {
@@ -1417,17 +2117,11 @@ function setCurrentTime(t, { source = null } = {}) {
     updateChartValues(sensorName, state.sensorData.get(sensorName));
   }
 
-  if (state.locationData) {
-    const lat = state.locationData.series.latitude || [];
-    const lon = state.locationData.series.longitude || [];
-    const idx = nearestIndex(state.locationData.times, clamped);
-    if (state.mapMarker && Number.isFinite(lat[idx]) && Number.isFinite(lon[idx])) {
-      state.mapMarker.setLatLng([lat[idx], lon[idx]]);
-    }
-  }
+  if (state.locationData) placeMapMarker();
 
   drawEyeOverlay(state.mediaPlayers.get("eye-scene"));
   syncAnnotations();
+  highlightTranscript();
 }
 
 function togglePlay() {
@@ -1464,7 +2158,138 @@ function tick(now) {
   requestAnimationFrame(tick);
 }
 
+async function reloadIfAssetsChanged() {
+  let payload;
+  try {
+    const response = await fetch("/api/asset-version", { cache: "no-store" });
+    if (!response.ok) return false;
+    payload = await response.json();
+  } catch {
+    return false;
+  }
+  const current = document.querySelector('meta[name="asset-version"]')?.content || "";
+  if (!payload.version || payload.version === current) return false;
+  const url = new URL(location.href);
+  if (url.searchParams.get("v") === String(payload.version)) return false;
+  url.searchParams.set("v", payload.version);
+  const path = els.dataPath?.value?.trim();
+  if (path) sessionStorage.setItem(PENDING_PATH_KEY, path);
+  location.replace(url);
+  return true;
+}
+
+function renderTranscript() {
+  if (!els.transcriptBody || !els.transcriptStatus) return;
+  const payload = state.transcript;
+  const stateName = payload?.state || "";
+  if (els.transcriptAgain) els.transcriptAgain.hidden = stateName !== "done" && stateName !== "error";
+  if (stateName === "running" || stateName === "absent") {
+    els.transcriptStatus.textContent = "Transcribing the microphone…";
+  } else if (stateName === "error") {
+    els.transcriptStatus.textContent = payload.error || "Transcription failed.";
+  } else if (stateName === "unavailable") {
+    els.transcriptStatus.textContent = "No microphone recording";
+  } else {
+    els.transcriptStatus.textContent = "";
+  }
+  els.transcriptBody.replaceChildren();
+  const query = state.transcriptQuery.trim().toLowerCase();
+  for (const line of payload?.lines || []) {
+    const spoken = line.kind === "speech" ? (line.words || []).map((word) => word.text).join(" ") : "";
+    if (query && !spoken.toLowerCase().includes(query)) continue;
+    const row = document.createElement("div");
+    row.className = "transcript-line";
+    row.append(transcriptStamp(line.start), transcriptStamp(line.end));
+    const words = document.createElement("span");
+    words.className = "transcript-words";
+    if (line.kind === "silence") {
+      const silence = document.createElement("span");
+      silence.className = "transcript-silence";
+      silence.dataset.start = String(line.start);
+      silence.dataset.end = String(line.end);
+      silence.textContent = "    ";
+      words.append(silence);
+    } else {
+      (line.words || []).forEach((word, index) => {
+        if (index) words.append(document.createTextNode(" "));
+        const token = document.createElement("span");
+        token.className = "transcript-word";
+        token.dataset.start = String(word.start);
+        token.dataset.end = String(word.end);
+        token.textContent = word.text;
+        words.append(token);
+      });
+    }
+    row.append(words);
+    els.transcriptBody.append(row);
+  }
+  state.transcriptActive = null;
+  highlightTranscript();
+}
+
+function transcriptStamp(time) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "transcript-stamp";
+  button.dataset.time = String(time);
+  button.textContent = formatStamp(time);
+  button.title = "Jump to this time";
+  button.addEventListener("click", () => setCurrentTime(Number(time)));
+  return button;
+}
+
+function highlightTranscript() {
+  if (!els.transcriptBody) return;
+  const time = state.currentTime || 0;
+  let active = null;
+  for (const node of els.transcriptBody.querySelectorAll("[data-start]")) {
+    const start = Number(node.dataset.start);
+    const end = Number(node.dataset.end);
+    const on = time >= start && time < end;
+    node.classList.toggle("is-current", on);
+    if (on) active = node;
+  }
+  if (active && active !== state.transcriptActive) {
+    state.transcriptActive = active;
+    active.scrollIntoView({ block: "nearest" });
+  } else if (!active) {
+    state.transcriptActive = null;
+  }
+}
+
+function applyTranscript(payload) {
+  const wasRunning = state.transcript?.state === "running";
+  state.transcript = payload;
+  renderTranscript();
+  if (state.transcriptPoll) window.clearTimeout(state.transcriptPoll);
+  state.transcriptPoll = 0;
+  if (payload?.state === "running") {
+    state.transcriptPoll = window.setTimeout(() => {
+      fetchJson("/api/transcript")
+        .then(applyTranscript)
+        .catch((error) => {
+          if (els.transcriptStatus) els.transcriptStatus.textContent = error.message;
+        });
+    }, 2000);
+    return;
+  }
+  if (payload?.state === "done" && wasRunning) loadEvents().catch(() => {});
+}
+
+async function ensureTranscript() {
+  if (state.transcriptPoll) window.clearTimeout(state.transcriptPoll);
+  state.transcriptPoll = 0;
+  const payload = await fetchJson("/api/transcript");
+  if (payload.state === "absent") {
+    applyTranscript(await fetchJson("/api/transcript", { method: "POST" }));
+    return;
+  }
+  applyTranscript(payload);
+}
+
 async function loadSession(pathValue) {
+  if (els.dataPath && pathValue) els.dataPath.value = pathValue;
+  if (await reloadIfAssetsChanged()) return;
   closeSyncReport();
   const params = new URLSearchParams();
   if (pathValue) params.set("data_path", pathValue);
@@ -1489,6 +2314,9 @@ async function loadSession(pathValue) {
   await refreshCharts();
   await loadEvents();
   setCurrentTime(0);
+  ensureTranscript().catch((error) => {
+    if (els.transcriptStatus) els.transcriptStatus.textContent = error.message;
+  });
 }
 
 function loadCustomMarks() {
@@ -2055,8 +2883,8 @@ function renderEventsAtStamp(stamp) {
     if (els.annotateEvent) els.annotateEvent.value = last.event;
     if (els.annotateDescription) els.annotateDescription.value = last.description;
     annotationFilled = { event: last.event, description: last.description };
-    return;
-  }
+      return;
+    }
   if (
     annotationFilled &&
     els.annotateEvent?.value === annotationFilled.event &&
@@ -2753,6 +3581,24 @@ function saveSyncMarkdown() {
 }
 
 function wireEvents() {
+  els.transcriptSearch?.addEventListener("input", () => {
+    state.transcriptQuery = els.transcriptSearch.value;
+    renderTranscript();
+  });
+  els.transcriptAgain?.addEventListener("click", () => {
+    fetchJson("/api/transcript", { method: "POST" })
+      .then(applyTranscript)
+      .catch((error) => {
+        if (els.transcriptStatus) els.transcriptStatus.textContent = error.message;
+      });
+  });
+  els.mapMove?.addEventListener("click", () => setMapEdit(state.mapEdit === "move" ? null : "move"));
+  els.mapRedraw?.addEventListener("click", () => setMapEdit(state.mapEdit === "redraw" ? null : "redraw"));
+  els.mapEditApply?.addEventListener("click", applyRedraw);
+  els.mapEditCancel?.addEventListener("click", () => setMapEdit(null));
+  els.mapTrackRaw?.addEventListener("click", () => setMapTrack("raw"));
+  els.mapTrackClean?.addEventListener("click", () => setMapTrack("clean"));
+  els.mapTrackBoth?.addEventListener("click", () => setMapTrack("both"));
   els.reloadBtn.addEventListener("click", () => {
     loadSession(els.dataPath.value.trim()).catch((err) => {
       alert(`Failed to load data: ${err.message}`);
@@ -2906,10 +3752,13 @@ function wireEvents() {
 }
 
 async function init() {
+  if (await reloadIfAssetsChanged()) return;
   syncThemeButton();
   loadCollapsedGroups();
   ensureOpenMedia();
   loadRotations();
+  loadFlips();
+  loadMapTrack();
   renderAnnotationMarks();
   const savedJump = Number(localStorage.getItem(JUMP_KEY));
   if (els.jumpWindow && Number.isFinite(savedJump) && savedJump > 0) els.jumpWindow.value = String(savedJump);
@@ -2927,6 +3776,17 @@ async function init() {
     onResize: resizeCharts,
   });
   wireEvents();
+  const pendingPath = sessionStorage.getItem(PENDING_PATH_KEY);
+  if (pendingPath) {
+    sessionStorage.removeItem(PENDING_PATH_KEY);
+    if (els.dataPath) els.dataPath.value = pendingPath;
+    try {
+      await loadSession(pendingPath);
+    } catch (error) {
+      alert(`Failed to load data: ${error.message}`);
+    }
+    return;
+  }
   try {
     const session = await fetchJson("/api/session");
     state.session = session;
@@ -2940,6 +3800,9 @@ async function init() {
     await refreshCharts();
     await loadEvents();
     setCurrentTime(0);
+    ensureTranscript().catch((error) => {
+      if (els.transcriptStatus) els.transcriptStatus.textContent = error.message;
+    });
   } catch {
     els.meta.textContent = "Write the path to a CaptureApp CSV exported data folder then click Load.";
   }

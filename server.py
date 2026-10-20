@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -23,6 +23,7 @@ from loaders import load_sensors, ordered_sensors, reload_sensor
 from loaders.common import sensor_view
 from loaders.eyetracking import load_eye_overlay
 from sync_accuracy import evaluate
+import transcript
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = BASE_DIR / "Data"
@@ -329,8 +330,8 @@ def _events_path() -> Path:
     return path
 
 
-def _read_events() -> list[dict[str, Any]]:
-    path = _events_path()
+def _read_events(data_dir: Path | None = None) -> list[dict[str, Any]]:
+    path = _events_path() if data_dir is None else Path(data_dir) / "EventTable.csv"
     if not path.is_file():
         return []
     events: list[dict[str, Any]] = []
@@ -382,8 +383,12 @@ def _clean_events(rows: list[Any]) -> list[dict[str, Any]]:
     return cleaned
 
 
-def _write_events(events: list[dict[str, Any]]) -> None:
-    path = _events_path()
+def _write_recording_events(data_dir: Path, events: list[dict[str, Any]]) -> None:
+    _write_events(events, data_dir)
+
+
+def _write_events(events: list[dict[str, Any]], data_dir: Path | None = None) -> None:
+    path = _events_path() if data_dir is None else Path(data_dir) / "EventTable.csv"
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=["time", "Event", "Description"])
         writer.writeheader()
@@ -395,6 +400,40 @@ def _write_events(events: list[dict[str, Any]]) -> None:
                     "Description": item["description"],
                 }
             )
+
+
+def _microphone_file() -> Path | None:
+    if not _session.get("data_dir"):
+        return None
+    rel = str((_session.get("media") or {}).get("audio") or "")
+    if not rel:
+        return None
+    root = Path(_session["data_dir"]).resolve()
+    path = (root / rel).resolve()
+    if path != root and root not in path.parents:
+        return None
+    if not path.is_file():
+        return None
+    return path
+
+
+@app.get("/api/transcript")
+def api_transcript() -> dict[str, Any]:
+    if not _session.get("data_dir"):
+        raise HTTPException(status_code=404, detail="No recording loaded.")
+    audio = _microphone_file()
+    return transcript.public_view(Path(_session["data_dir"]).resolve(), audio.name if audio else None)
+
+
+@app.post("/api/transcript")
+def api_transcript_start() -> dict[str, Any]:
+    if not _session.get("data_dir"):
+        raise HTTPException(status_code=404, detail="No recording loaded.")
+    audio = _microphone_file()
+    data_dir = Path(_session["data_dir"]).resolve()
+    if audio is None:
+        return transcript.public_view(data_dir, None)
+    return transcript.start(data_dir, audio, _read_events, _write_recording_events)
 
 
 @app.get("/api/events")
@@ -914,5 +953,48 @@ def api_media(file_path: str) -> FileResponse:
     return FileResponse(target)
 
 
+_PAGE_ASSETS = ("styles.css", "layout.js", "app.js")
+
+
+def _asset_version() -> str:
+    stamps = []
+    for name in ("index.html", *_PAGE_ASSETS):
+        path = STATIC_DIR / name
+        if path.is_file():
+            stamps.append(path.stat().st_mtime_ns)
+    return str(max(stamps) if stamps else 0)
+
+
+def _index_page() -> str:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    version = _asset_version()
+    for name in _PAGE_ASSETS:
+        path = STATIC_DIR / name
+        stamp = path.stat().st_mtime_ns if path.is_file() else version
+        html = html.replace(f'"/{name}"', f'"/{name}?v={stamp}"')
+    token = f'<meta name="asset-version" content="{version}" />'
+    return html.replace("<head>", f"<head>\n  {token}", 1)
+
+
+class RevalidatedStaticFiles(StaticFiles):
+    """Ask the browser to recheck app files instead of reusing a saved copy."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith((".html", ".js", ".css")):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+@app.get("/api/asset-version")
+def api_asset_version() -> dict[str, str]:
+    return {"version": _asset_version()}
+
+
+@app.get("/")
+def index_page() -> HTMLResponse:
+    return HTMLResponse(_index_page(), headers={"Cache-Control": "no-store"})
+
+
 if STATIC_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    app.mount("/", RevalidatedStaticFiles(directory=str(STATIC_DIR), html=True), name="static")

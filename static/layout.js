@@ -113,9 +113,26 @@ const PanelLayout = (() => {
       }
       seen.add(key);
     }
+    placeTranscript();
+  }
+
+  function isMediaPanel(panel) {
+    const id = panel.dataset.panel || "";
+    return id === "audio" || id === "video" || id.startsWith("video:");
+  }
+
+  function placeTranscript() {
+    if (!workspace) return;
+    const panels = [...workspace.querySelectorAll(":scope > .workspace-panel")];
+    const transcript = panels.find((panel) => panel.dataset.panel === "transcript");
+    if (!transcript) return;
+    const media = panels.filter((panel) => panel !== transcript && isMediaPanel(panel));
+    const rest = panels.filter((panel) => panel !== transcript && !isMediaPanel(panel));
+    for (const panel of [...media, transcript, ...rest]) workspace.append(panel);
   }
 
   function rememberOrder() {
+    placeTranscript();
     saved.order = [...workspace.querySelectorAll(":scope > .workspace-panel")].map(
       (panel) => panel.dataset.panel,
     );
@@ -250,9 +267,10 @@ const PanelLayout = (() => {
       const id = panel.dataset.panel || "";
       if (id === "video:phone-video" || id === "video") return 0;
       if (id.startsWith("video:")) return 1;
-      if (id === "map") return 2;
-      if (id === "audio") return 3;
-      return 4;
+      if (id === "audio") return 2;
+      if (id === "transcript") return 3;
+      if (id === "map") return 4;
+      return 5;
     };
     panels.sort((a, b) => rank(a) - rank(b));
     for (const panel of panels) {
@@ -278,5 +296,5 @@ const PanelLayout = (() => {
     scheduleResize();
   }
 
-  return { init, decorate, applyOrder, setWidth };
+  return { init, decorate, applyOrder, placeTranscript, setWidth };
 })();
