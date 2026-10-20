@@ -1,7 +1,8 @@
-"""Local microphone transcription with word times."""
+"""Local transcription of the phone camera audio, with word times."""
 
 from __future__ import annotations
 
+import csv
 import json
 import threading
 from collections import Counter
@@ -23,6 +24,34 @@ _jobs_lock = threading.Lock()
 
 def cache_path(data_dir: Path) -> Path:
     return data_dir / ".capture" / "transcript.json"
+
+
+def transcript_file(data_dir: Path) -> Path:
+    return data_dir / "Transcript.csv"
+
+
+def _line_text(line: dict[str, Any]) -> str:
+    if line.get("kind") == "silence":
+        return ""
+    return " ".join(str(word.get("text") or "").strip() for word in line.get("words") or []).strip()
+
+
+def _write_transcript_file(data_dir: Path, lines: list[dict[str, Any]]) -> None:
+    """Write the transcript beside the recording CSVs."""
+    path = transcript_file(data_dir)
+    temporary = path.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["time_start", "time_end", "text"])
+        writer.writeheader()
+        for line in lines:
+            writer.writerow(
+                {
+                    "time_start": f"{float(line['start']):.2f}",
+                    "time_end": f"{float(line['end']):.2f}",
+                    "text": _line_text(line),
+                }
+            )
+    temporary.replace(path)
 
 
 def lines_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -94,6 +123,9 @@ def public_view(data_dir: Path, source: str | None = None) -> dict[str, Any]:
     with _jobs_lock:
         job = dict(_jobs.get(key) or {})
     cached = _read_cache(data_dir)
+    cached_source = str((cached or {}).get("source") or "")
+    if source and cached_source and cached_source != source:
+        cached = None
     if job.get("state") == "running":
         return {"state": "running", "source": job.get("source") or source or "", "error": "", "lines": []}
     if job.get("state") == "error":
@@ -156,6 +188,7 @@ def _run(
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
         temporary.replace(path)
+        _write_transcript_file(data_dir, lines)
     except Exception as exc:
         with _jobs_lock:
             _jobs[key] = {"state": "error", "source": audio_path.name, "error": str(exc)}
@@ -187,38 +220,102 @@ def _model_instance() -> Any:
         return _model
 
 
-def _load_audio(audio_path: Path) -> Any:
-    """Read microphone audio at 16 kHz. PyAV in use here rejects metadata_errors."""
+def _decode_channels(audio_path: Path) -> tuple[list[Any], int]:
+    """Read each audio channel as float samples. Phone video is preferred by the caller."""
     import av
     import numpy as np
 
-    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
-    chunks: list[Any] = []
+    collected: list[list[Any]] = []
+    rate = 16000
     with av.open(str(audio_path), mode="r") as container:
         if not container.streams.audio:
-            raise RuntimeError("The microphone file has no audio.")
-        frames = list(container.decode(audio=0))
-    frames.append(None)
-    for frame in frames:
-        try:
-            converted = resampler.resample(frame)
-        except av.error.InvalidDataError:
-            continue
-        for item in converted:
-            chunks.append(np.asarray(item.to_ndarray()).reshape(-1))
-    if not chunks:
-        raise RuntimeError("The microphone file has no audio.")
-    return np.concatenate(chunks).astype(np.float32) / 32768.0
+            raise RuntimeError("The recording has no audio.")
+        stream = container.streams.audio[0]
+        rate = int(stream.sample_rate or rate)
+        for frame in container.decode(audio=0):
+            try:
+                samples = np.asarray(frame.to_ndarray(), dtype=np.float32)
+            except av.error.InvalidDataError:
+                continue
+            if samples.ndim == 1:
+                samples = samples.reshape(1, -1)
+            if not collected:
+                collected = [[] for _ in range(samples.shape[0])]
+            for index in range(min(len(collected), samples.shape[0])):
+                collected[index].append(samples[index])
+    if not collected or not collected[0]:
+        raise RuntimeError("The recording has no audio.")
+    return [np.concatenate(parts) for parts in collected], rate
+
+
+def _speech_samples(audio: Any) -> int:
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    marks = get_speech_timestamps(
+        audio,
+        VadOptions(threshold=0.35, min_silence_duration_ms=250, max_speech_duration_s=30),
+    )
+    return sum(int(mark["end"]) - int(mark["start"]) for mark in marks)
+
+
+def _choose_channel(channels: list[Any], rate: int) -> Any:
+    """Keep the channel that contains more speech. Duplicate stereo channels are averaged."""
+    import numpy as np
+
+    if len(channels) == 1:
+        return channels[0]
+    step = max(1, int(rate) // 16000)
+    reduced = [np.ascontiguousarray(channel[::step], dtype=np.float32) for channel in channels]
+    length = min(channel.size for channel in reduced)
+    if length < 16000:
+        return channels[0]
+    correlation = float(np.corrcoef(reduced[0][:length:40], reduced[1][:length:40])[0, 1])
+    native = min(channel.size for channel in channels)
+    if np.isfinite(correlation) and correlation > 0.9:
+        return ((channels[0][:native] + channels[1][:native]) * 0.5).astype(np.float32)
+    scores = [_speech_samples(channel[:length]) for channel in reduced]
+    return channels[int(np.argmax(scores))]
+
+
+def _resample(samples: Any, rate: int) -> Any:
+    import av
+    import numpy as np
+
+    audio = np.ascontiguousarray(samples, dtype=np.float32)
+    if rate == 16000:
+        return audio
+    resampler = av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=16000)
+    pieces: list[Any] = []
+    chunk = rate
+    for start in range(0, audio.size, chunk):
+        frame = av.AudioFrame.from_ndarray(audio[start : start + chunk].reshape(1, -1), format="fltp", layout="mono")
+        frame.sample_rate = rate
+        for item in resampler.resample(frame):
+            pieces.append(np.asarray(item.to_ndarray(), dtype=np.float32).reshape(-1))
+    for item in resampler.resample(None):
+        pieces.append(np.asarray(item.to_ndarray(), dtype=np.float32).reshape(-1))
+    if not pieces:
+        raise RuntimeError("The recording has no audio.")
+    return np.concatenate(pieces)
+
+
+def _load_audio(audio_path: Path) -> Any:
+    channels, rate = _decode_channels(audio_path)
+    return _resample(_choose_channel(channels, rate), rate)
 
 
 def _transcribe(audio_path: Path) -> list[dict[str, Any]]:
+    from faster_whisper.vad import VadOptions
+
     model = _model_instance()
     audio = _load_audio(audio_path)
+    voice = VadOptions(threshold=0.35, min_silence_duration_ms=250)
     try:
         segments, _info = model.transcribe(
             audio,
             word_timestamps=True,
             vad_filter=True,
+            vad_parameters=voice,
             condition_on_previous_text=False,
         )
     except Exception:

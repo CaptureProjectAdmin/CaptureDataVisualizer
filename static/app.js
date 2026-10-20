@@ -2131,6 +2131,7 @@ function togglePlay() {
   if (state.playing) {
     state.lastFrame = performance.now();
     for (const element of openMediaElements()) element.play().catch(() => {});
+    highlightTranscript({ follow: true, force: true });
     requestAnimationFrame(tick);
   } else {
     for (const player of state.mediaPlayers.values()) playerElement(player)?.pause();
@@ -2184,11 +2185,11 @@ function renderTranscript() {
   const stateName = payload?.state || "";
   if (els.transcriptAgain) els.transcriptAgain.hidden = stateName !== "done" && stateName !== "error";
   if (stateName === "running" || stateName === "absent") {
-    els.transcriptStatus.textContent = "Transcribing the microphone…";
+    els.transcriptStatus.textContent = "Transcribing the audio…";
   } else if (stateName === "error") {
     els.transcriptStatus.textContent = payload.error || "Transcription failed.";
   } else if (stateName === "unavailable") {
-    els.transcriptStatus.textContent = "No microphone recording";
+    els.transcriptStatus.textContent = "No audio recording";
   } else {
     els.transcriptStatus.textContent = "";
   }
@@ -2199,6 +2200,8 @@ function renderTranscript() {
     if (query && !spoken.toLowerCase().includes(query)) continue;
     const row = document.createElement("div");
     row.className = "transcript-line";
+    row.dataset.start = String(line.start);
+    row.dataset.end = String(line.end);
     row.append(transcriptStamp(line.start), transcriptStamp(line.end));
     const words = document.createElement("span");
     words.className = "transcript-words";
@@ -2224,7 +2227,7 @@ function renderTranscript() {
     els.transcriptBody.append(row);
   }
   state.transcriptActive = null;
-  highlightTranscript();
+  highlightTranscript({ follow: false });
 }
 
 function transcriptStamp(time) {
@@ -2238,23 +2241,46 @@ function transcriptStamp(time) {
   return button;
 }
 
-function highlightTranscript() {
+function highlightTranscript({ follow = state.playing, force = false } = {}) {
   if (!els.transcriptBody) return;
   const time = state.currentTime || 0;
   let active = null;
-  for (const node of els.transcriptBody.querySelectorAll("[data-start]")) {
+  for (const node of els.transcriptBody.querySelectorAll(".transcript-word, .transcript-silence")) {
     const start = Number(node.dataset.start);
     const end = Number(node.dataset.end);
     const on = time >= start && time < end;
     node.classList.toggle("is-current", on);
     if (on) active = node;
   }
-  if (active && active !== state.transcriptActive) {
-    state.transcriptActive = active;
-    active.scrollIntoView({ block: "nearest" });
-  } else if (!active) {
-    state.transcriptActive = null;
+  const changed = active !== state.transcriptActive;
+  state.transcriptActive = active;
+  if (follow && (force || changed)) scrollTranscriptToTime(time, { force: true });
+}
+
+function scrollTranscriptToTime(time, { force = false } = {}) {
+  const body = els.transcriptBody;
+  if (!body) return;
+  const target = body.querySelector(".is-current") || transcriptRowAt(time);
+  if (!target) return;
+  const top = target.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop;
+  const bottom = top + target.offsetHeight;
+  const viewTop = body.scrollTop;
+  const viewBottom = viewTop + body.clientHeight;
+  if (!force && top >= viewTop && bottom <= viewBottom) return;
+  const next = top - Math.max(0, (body.clientHeight - target.offsetHeight) / 2);
+  body.scrollTo({ top: Math.max(0, next) });
+}
+
+function transcriptRowAt(time) {
+  const rows = [...els.transcriptBody.querySelectorAll(".transcript-line")];
+  let upcoming = null;
+  for (const row of rows) {
+    const start = Number(row.dataset.start);
+    const end = Number(row.dataset.end);
+    if (time >= start && time < end) return row;
+    if (upcoming === null && start > time) upcoming = row;
   }
+  return upcoming || rows[rows.length - 1] || null;
 }
 
 function applyTranscript(payload) {

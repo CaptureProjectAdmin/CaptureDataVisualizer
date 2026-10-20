@@ -90,7 +90,7 @@ def _list_sensor_csvs(data_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in data_dir.glob("*.csv")
-        if path.name.lower() not in {"metadata.csv", "camera.csv", "eventtable.csv"}
+        if path.name.lower() not in {"metadata.csv", "camera.csv", "eventtable.csv", "transcript.csv"}
     )
 
 

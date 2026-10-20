@@ -726,7 +726,8 @@ select {
 .workspace-panel.transcript-card {
   flex: 0 0 100%;
   width: 100%;
-  height: 280px;
+  height: min(70vh, 640px);
+  min-height: 220px;
 }
 
 .transcript-card .panel-toolbar .sensor-search {
@@ -753,7 +754,8 @@ select {
 .transcript-body {
   flex: 1 1 auto;
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   font-size: 0.8rem;
   line-height: 1.45;
 }

@@ -402,10 +402,10 @@ def _write_events(events: list[dict[str, Any]], data_dir: Path | None = None) ->
             )
 
 
-def _microphone_file() -> Path | None:
+def _media_file(key: str) -> Path | None:
     if not _session.get("data_dir"):
         return None
-    rel = str((_session.get("media") or {}).get("audio") or "")
+    rel = str((_session.get("media") or {}).get(key) or "")
     if not rel:
         return None
     root = Path(_session["data_dir"]).resolve()
@@ -417,11 +417,23 @@ def _microphone_file() -> Path | None:
     return path
 
 
+def _microphone_file() -> Path | None:
+    return _media_file("audio")
+
+
+def _transcript_audio() -> Path | None:
+    """Transcribe the phone camera video. Use the microphone only when that video is missing."""
+    video = _media_file("video")
+    if video is not None:
+        return video
+    return _microphone_file()
+
+
 @app.get("/api/transcript")
 def api_transcript() -> dict[str, Any]:
     if not _session.get("data_dir"):
         raise HTTPException(status_code=404, detail="No recording loaded.")
-    audio = _microphone_file()
+    audio = _transcript_audio()
     return transcript.public_view(Path(_session["data_dir"]).resolve(), audio.name if audio else None)
 
 
@@ -429,7 +441,7 @@ def api_transcript() -> dict[str, Any]:
 def api_transcript_start() -> dict[str, Any]:
     if not _session.get("data_dir"):
         raise HTTPException(status_code=404, detail="No recording loaded.")
-    audio = _microphone_file()
+    audio = _transcript_audio()
     data_dir = Path(_session["data_dir"]).resolve()
     if audio is None:
         return transcript.public_view(data_dir, None)

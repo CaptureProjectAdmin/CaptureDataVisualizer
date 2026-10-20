@@ -126,9 +126,16 @@ const PanelLayout = (() => {
     const panels = [...workspace.querySelectorAll(":scope > .workspace-panel")];
     const transcript = panels.find((panel) => panel.dataset.panel === "transcript");
     if (!transcript) return;
-    const media = panels.filter((panel) => panel !== transcript && isMediaPanel(panel));
-    const rest = panels.filter((panel) => panel !== transcript && !isMediaPanel(panel));
-    for (const panel of [...media, transcript, ...rest]) workspace.append(panel);
+    const map = panels.find((panel) => panel.dataset.panel === "map");
+    const media = panels.filter((panel) => isMediaPanel(panel));
+    const mapAbove = Boolean(map) && panels.indexOf(map) < panels.indexOf(transcript);
+    const rest = panels.filter((panel) => {
+      if (panel === transcript || isMediaPanel(panel)) return false;
+      if (mapAbove && panel === map) return false;
+      return true;
+    });
+    const ordered = mapAbove ? [...media, map, transcript, ...rest] : [...media, transcript, ...rest];
+    for (const panel of ordered) workspace.append(panel);
   }
 
   function rememberOrder() {
