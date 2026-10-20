@@ -12,6 +12,72 @@ from typing import Any, Callable
 PAUSE_S = 0.6
 TALK_BEGIN = "Talk Begin"
 TALK_END = "Talk End"
+TRANSCRIPT_PIPELINE = 3
+# Short navigation phrases spoken on the walk. Kept at the front so they survive the prompt limit.
+NAVIGATION_CUES = (
+    "Wrong way",
+    "You're going the wrong way",
+    "Left",
+    "Right",
+    "Go straight",
+    "Exit that door",
+    "Turn left",
+    "Turn right",
+    "Turn around",
+    "Go back",
+    "Stop",
+    "Wait",
+    "This way",
+    "That way",
+    "Straight ahead",
+    "Keep going",
+    "Follow me",
+    "On your left",
+    "On your right",
+    "Through the door",
+    "Enter the door",
+    "Exit",
+    "Doorway",
+    "Upstairs",
+    "Downstairs",
+    "Go inside",
+    "Go outside",
+    "Cross the street",
+    "Wait here",
+    "Come this way",
+    "The other way",
+    "Take a left",
+    "Take a right",
+    "Bear left",
+    "Bear right",
+    "Go forward",
+    "Go ahead",
+    "Not that way",
+    "Back up",
+    "Out that door",
+    "In that door",
+    "Next door",
+    "Around the corner",
+    "Keep left",
+    "Keep right",
+    "Slight left",
+    "Slight right",
+    "Make a left",
+    "Make a right",
+    "Continue straight",
+    "Down the hall",
+    "To the left",
+    "To the right",
+    "Straight through",
+    "Wrong door",
+    "That door",
+    "This door",
+    "Go through",
+    "Step outside",
+    "Step inside",
+    "Dead end",
+    "U-turn",
+)
 
 ReadEvents = Callable[[Path], list[dict[str, Any]]]
 WriteEvents = Callable[[Path, list[dict[str, Any]]], None]
@@ -122,10 +188,7 @@ def public_view(data_dir: Path, source: str | None = None) -> dict[str, Any]:
     key = str(data_dir)
     with _jobs_lock:
         job = dict(_jobs.get(key) or {})
-    cached = _read_cache(data_dir)
-    cached_source = str((cached or {}).get("source") or "")
-    if source and cached_source and cached_source != source:
-        cached = None
+    cached = _usable_cache(data_dir, source)
     if job.get("state") == "running":
         return {"state": "running", "source": job.get("source") or source or "", "error": "", "lines": []}
     if job.get("state") == "error":
@@ -182,7 +245,12 @@ def _run(
         previous = _read_cache(data_dir)
         merged = replace_auto_events(read_events(data_dir), list((previous or {}).get("events") or []), new_events)
         write_events(data_dir, merged)
-        payload = {"source": audio_path.name, "lines": lines, "events": new_events}
+        payload = {
+            "pipeline": TRANSCRIPT_PIPELINE,
+            "source": audio_path.name,
+            "lines": lines,
+            "events": new_events,
+        }
         path = cache_path(data_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".json.tmp")
@@ -195,6 +263,19 @@ def _run(
         return
     with _jobs_lock:
         _jobs[key] = {"state": "done", "source": audio_path.name, "error": ""}
+
+
+def _usable_cache(data_dir: Path, source: str | None) -> dict[str, Any] | None:
+    """Ignore a saved transcript from another audio file or an older pipeline."""
+    cached = _read_cache(data_dir)
+    if not cached:
+        return None
+    if int(cached.get("pipeline") or 0) != TRANSCRIPT_PIPELINE:
+        return None
+    cached_source = str(cached.get("source") or "")
+    if source and cached_source and cached_source != source:
+        return None
+    return cached
 
 
 def _read_cache(data_dir: Path) -> dict[str, Any] | None:
@@ -248,14 +329,171 @@ def _decode_channels(audio_path: Path) -> tuple[list[Any], int]:
     return [np.concatenate(parts) for parts in collected], rate
 
 
-def _speech_samples(audio: Any) -> int:
-    from faster_whisper.vad import VadOptions, get_speech_timestamps
+def _vad_options() -> Any:
+    from faster_whisper.vad import VadOptions
 
-    marks = get_speech_timestamps(
-        audio,
-        VadOptions(threshold=0.35, min_silence_duration_ms=250, max_speech_duration_s=30),
+    return VadOptions(
+        threshold=0.25,
+        min_speech_duration_ms=60,
+        min_silence_duration_ms=250,
+        speech_pad_ms=300,
     )
+
+
+def _speech_samples(audio: Any) -> int:
+    from faster_whisper.vad import get_speech_timestamps
+
+    marks = get_speech_timestamps(audio, _vad_options())
     return sum(int(mark["end"]) - int(mark["start"]) for mark in marks)
+
+
+def _highpass(samples: Any, rate: int, cutoff: float = 100.0) -> Any:
+    """Remove wind rumble below the voice."""
+    import numpy as np
+    from scipy import signal
+
+    audio = np.ascontiguousarray(samples, dtype=np.float32)
+    if audio.size == 0 or rate <= cutoff * 2:
+        return audio
+    sos = signal.butter(2, cutoff, btype="highpass", fs=rate, output="sos")
+    return np.ascontiguousarray(signal.sosfilt(sos, audio), dtype=np.float32)
+
+
+def _enhance_voice(samples: Any, rate: int) -> Any:
+    """Turn down wind around the voice. The speech band is reduced only lightly."""
+    import numpy as np
+    from scipy import signal
+    from scipy.ndimage import uniform_filter1d
+
+    audio = np.ascontiguousarray(samples, dtype=np.float32)
+    if audio.size < rate // 2:
+        return audio
+    nperseg = 512
+    noverlap = 256
+    freqs, _, spectrum = signal.stft(
+        audio,
+        fs=rate,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        window="hann",
+        boundary="zeros",
+        padded=True,
+    )
+    power = (np.abs(spectrum) ** 2).astype(np.float32)
+    hop = nperseg - noverlap
+    chunk = max(1, int(rate * 8 / hop))
+    noise = np.empty_like(power)
+    for start in range(0, power.shape[1], chunk):
+        end = min(power.shape[1], start + chunk)
+        context_start = max(0, start - chunk // 4)
+        context_end = min(power.shape[1], end + chunk // 4)
+        noise[:, start:end] = np.percentile(power[:, context_start:context_end], 20, axis=1, keepdims=True)
+    strength = np.full(freqs.shape[0], 0.7, dtype=np.float32)
+    strength[freqs < 250] = 0.95
+    strength[(freqs >= 300) & (freqs <= 3400)] = 0.4
+    gain = 1.0 - strength[:, None] * (noise / (power + 1e-10))
+    np.clip(gain, 0.12, 1.0, out=gain)
+    gain = uniform_filter1d(gain, size=3, axis=1, mode="nearest")
+    _, enhanced = signal.istft(
+        spectrum * gain,
+        fs=rate,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        window="hann",
+        input_onesided=True,
+        boundary="zeros",
+    )
+    enhanced = np.ascontiguousarray(enhanced, dtype=np.float32)
+    if enhanced.size < audio.size:
+        enhanced = np.pad(enhanced, (0, audio.size - enhanced.size))
+    return enhanced[: audio.size]
+
+
+def _compress(samples: Any, rate: int) -> Any:
+    """Lift a quiet voice toward a normal speaking level, up to about 11 dB."""
+    import numpy as np
+    from scipy.ndimage import uniform_filter1d
+
+    audio = np.ascontiguousarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    window = max(1, int(rate * 0.04))
+    power = np.convolve(audio.astype(np.float64) ** 2, np.ones(window) / window, mode="same")
+    level = np.sqrt(np.maximum(power, 1e-12))
+    target = 0.06
+    max_gain = 3.5
+    gain = np.ones(level.shape, dtype=np.float64)
+    audible = level >= 0.004
+    gain[audible] = np.maximum(1.0, np.minimum(max_gain, (target / level[audible]) ** (2.0 / 3.0)))
+    loud = level > 0.2
+    gain[loud] = np.minimum(gain[loud], 0.2 / level[loud])
+    gain = uniform_filter1d(gain, size=max(1, int(rate * 0.08)), mode="nearest")
+    enhanced = audio * gain.astype(np.float32)
+    peak = float(np.max(np.abs(enhanced))) if enhanced.size else 0.0
+    if peak > 0.98:
+        enhanced *= np.float32(0.98 / peak)
+    return np.ascontiguousarray(enhanced, dtype=np.float32)
+
+
+def _navigation_hotwords(model: Any) -> str:
+    """Prompt text for the navigation dictionary, trimmed to Whisper's prompt budget."""
+    tokenizer = model.hf_tokenizer
+
+    def token_count(text: str) -> int:
+        encoded = tokenizer.encode(" " + text)
+        ids = encoded.ids if hasattr(encoded, "ids") else encoded
+        return len(ids)
+
+    kept: list[str] = []
+    for phrase in NAVIGATION_CUES:
+        trial = ". ".join([*kept, phrase]) + "."
+        if token_count(trial) >= 220:
+            break
+        kept.append(phrase)
+    if not kept:
+        return NAVIGATION_CUES[0]
+    return ". ".join(kept) + "."
+
+
+def _repair_word_times(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pull a word that was timestamped into a long pause back onto the next word."""
+    repaired = [dict(word) for word in words]
+    for index in range(len(repaired) - 1):
+        if str(repaired[index]["text"]).rstrip().endswith((".", "?", "!")):
+            continue
+        gap = float(repaired[index + 1]["start"]) - float(repaired[index]["end"])
+        if gap <= 3.0:
+            continue
+        duration = max(0.08, float(repaired[index]["end"]) - float(repaired[index]["start"]))
+        repaired[index]["end"] = float(repaired[index + 1]["start"])
+        repaired[index]["start"] = max(0.0, repaired[index]["end"] - duration)
+    return repaired
+
+
+def _segment_words(segment: Any) -> list[dict[str, Any]]:
+    """Drop a segment that is silence, repetition, or too unsure to trust."""
+    if float(getattr(segment, "avg_logprob", -10.0)) < -1.2:
+        return []
+    if float(getattr(segment, "compression_ratio", 0.0)) > 2.4:
+        return []
+    if float(getattr(segment, "no_speech_prob", 0.0)) > 0.85 and float(getattr(segment, "avg_logprob", -10.0)) < -0.6:
+        return []
+    spoken = list(segment.words or [])
+    words: list[dict[str, Any]] = []
+    if spoken:
+        for word in spoken:
+            text = str(word.word or "").strip()
+            if not text:
+                continue
+            probability = getattr(word, "probability", None)
+            if probability is not None and float(probability) < 0.05:
+                continue
+            words.append({"start": float(word.start), "end": float(word.end), "text": text})
+        return _repair_word_times(words)
+    text = str(segment.text or "").strip()
+    if not text:
+        return []
+    return [{"start": float(segment.start), "end": float(segment.end), "text": text}]
 
 
 def _choose_channel(channels: list[Any], rate: int) -> Any:
@@ -301,36 +539,36 @@ def _resample(samples: Any, rate: int) -> Any:
 
 def _load_audio(audio_path: Path) -> Any:
     channels, rate = _decode_channels(audio_path)
-    return _resample(_choose_channel(channels, rate), rate)
+    filtered = [_highpass(channel, rate) for channel in channels]
+    chosen = _choose_channel(filtered, rate)
+    speech = _resample(chosen, rate)
+    speech = _enhance_voice(speech, 16000)
+    return _compress(speech, 16000)
+
+
+def _transcribe_samples(model: Any, audio: Any) -> list[dict[str, Any]]:
+    hotwords = _navigation_hotwords(model)
+    settings = {
+        "language": "en",
+        "word_timestamps": True,
+        "temperature": 0.0,
+        "condition_on_previous_text": False,
+        "hotwords": hotwords,
+        "no_speech_threshold": 0.75,
+        "log_prob_threshold": -1.0,
+        "compression_ratio_threshold": 2.4,
+        "hallucination_silence_threshold": 2.0,
+    }
+    try:
+        segments, _info = model.transcribe(audio, vad_filter=True, vad_parameters=_vad_options(), **settings)
+    except Exception:
+        segments, _info = model.transcribe(audio, vad_filter=False, **settings)
+    words: list[dict[str, Any]] = []
+    for segment in segments:
+        words.extend(_segment_words(segment))
+    return words
 
 
 def _transcribe(audio_path: Path) -> list[dict[str, Any]]:
-    from faster_whisper.vad import VadOptions
-
     model = _model_instance()
-    audio = _load_audio(audio_path)
-    voice = VadOptions(threshold=0.35, min_silence_duration_ms=250)
-    try:
-        segments, _info = model.transcribe(
-            audio,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=voice,
-            condition_on_previous_text=False,
-        )
-    except Exception:
-        segments, _info = model.transcribe(
-            audio,
-            word_timestamps=True,
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
-    words: list[dict[str, Any]] = []
-    for segment in segments:
-        segment_words = list(segment.words or [])
-        if segment_words:
-            for word in segment_words:
-                words.append({"start": float(word.start), "end": float(word.end), "text": word.word or ""})
-            continue
-        words.append({"start": float(segment.start), "end": float(segment.end), "text": segment.text or ""})
-    return words
+    return _transcribe_samples(model, _load_audio(audio_path))

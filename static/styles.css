@@ -726,8 +726,8 @@ select {
 .workspace-panel.transcript-card {
   flex: 0 0 100%;
   width: 100%;
-  height: min(70vh, 640px);
-  min-height: 220px;
+  height: min(35vh, 320px);
+  min-height: 110px;
 }
 
 .transcript-card .panel-toolbar .sensor-search {
@@ -1232,7 +1232,8 @@ select {
 .video-card,
 .audio-card,
 .map-section,
-.chart-card {
+.chart-card,
+.transcript-card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
